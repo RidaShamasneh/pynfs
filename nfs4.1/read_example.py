@@ -7,8 +7,7 @@ Usage (from the nfs4.1 directory, after `python3 setup.py build`):
     ./read_example.py 127.0.0.1 /hello.txt
     ./read_example.py --rdma 10.9.9.1 /srv/nfs/share/tree/file   # port 20049
 
---rdma uses RPC-over-RDMA (needs python3-pyverbs).  Only small messages
-work for now: no RDMA chunks, so each call/reply must fit in 1024 bytes.
+--rdma uses RPC-over-RDMA (needs librdmacm and libibverbs from rdma-core).
 
 <path-inside-export> is relative to the server's pseudo-fs root, i.e. the
 same path you would see after mounting the server's root with NFSv4.

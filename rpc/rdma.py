@@ -3,9 +3,13 @@ RPC-over-RDMA version 1 (RFC 8166) client transport.
 
 RdmaPipe is a drop-in replacement for RpcPipe: the layers above it keep
 calling send_call()/listen() and deal in whole RPC records, only the bytes on
-the wire differ.
+the wire differ.  It talks to librdmacm/libibverbs through the small ctypes
+layer in rdma_verbs.py, so there is nothing to install except rdma-core.
 
 How messages travel:
+  * Connection setup sends the RFC 8797 private data, offering 4096 byte
+    inline buffers, and takes the server's answer to size what we may send
+    inline (1024 when the server sends none).
   * A call that fits the inline size goes in a single RDMA_MSG.
   * A larger call goes as RDMA_NOMSG with the whole RPC call in a Position
     Zero Read chunk: the call is copied to a registered buffer and the server
@@ -13,48 +17,56 @@ How messages travel:
   * Every call carries a Reply chunk, a registered buffer the server RDMA
     Writes a reply into if it does not fit inline (a "long reply").  The
     reply then arrives as RDMA_NOMSG and the data is taken from that buffer.
-  * No Write chunks (large READ data comes back in the Reply chunk, copied)
-    and no RFC 8797 CM private data (the pyverbs shipped with rdma-core 28
-    can not send it), so the inline size stays at the 1024 byte default.
+  * No Write chunks: large READ data comes back in the Reply chunk, copied.
   * The backchannel works over the same connection: calls from the server
     arrive as inline RDMA_MSG and are answered with an inline RDMA_MSG.
     Credits are kept apart (RFC 8167): the forward window is the server's
     grant from Replies, capped to the receive buffers not reserved for
     callbacks, and our backward Replies grant the reserved ones.
-  * Connection loss: when the peer disconnects or the QP breaks, the receive
-    thread notices (flush completions), every call still waiting for a reply
-    fails at once with RdmaError, later calls fail immediately, is_active()
-    turns False and the verbs resources are freed.  There is no reconnect.
-    A peer that vanishes without any disconnect is only noticed by the next
-    send failing; a call that merely times out leaves the connection alone.
+  * Connection loss: when the peer disconnects or the QP breaks (a CM event
+    or a flushed completion), every call still waiting for a reply fails at
+    once with RdmaError, later calls fail immediately, is_active() turns
+    False and the verbs resources are freed.  There is no reconnect.  A peer
+    that vanishes without any disconnect is only noticed by the next send
+    failing; a call that merely times out leaves the connection alone.
   * AUTH_NONE/AUTH_SYS are fine, GSS is untested.
 
-Requires the pyverbs python bindings (python3-pyverbs on Debian/Ubuntu).
 Usage:
     pipe = handler.connect_rdma((host, 20049))
 """
 from __future__ import absolute_import
 
+import os
 import random
+import select
 import struct
 import threading
-import time
-from collections import deque
 
+from . import rdma_verbs as verbs
 from .rpc import RpcPipe, log_t
 
 RPCRDMA_VERSION = 1
 DEFAULT_PORT = 20049
-INLINE_SIZE = 1024      # RFC 8166 section 3.3.2: default inline threshold
+MIN_INLINE_SIZE = 1024  # RFC 8166 section 3.3.2: used if nothing is negotiated
+INLINE_SIZE = 4096      # what we offer in the connection private data
 RECV_SLOTS = 16         # receive buffers posted, shared by replies and
                         # calls from the server
 BACK_SLOTS = 4          # of those, kept for calls from the server (RFC 8167):
                         # this is the backward credit grant we give
 REPLY_CHUNK_SIZE = 256 * 1024   # largest reply that can come back
+RESPONDER_RESOURCES = 16        # RDMA Reads the server may have outstanding
 RDMA_HDR = struct.Struct(">IIII")      # xid, vers, credits, proc
+
+# RFC 8797 connection private data: magic, version, flags, send size, recv
+# size (the sizes in kilobytes minus one)
+CMP_MAGIC = 0xf6ab0e18
+CMP_VERSION = 1
+CMP = struct.Struct(">IBBBB")
 
 # rpcrdma1_proc
 RDMA_MSG, RDMA_NOMSG, RDMA_MSGP, RDMA_DONE, RDMA_ERROR = range(5)
+
+SEND_WRID = 1 << 32     # work request id of sends; receives use their index
 
 
 class RdmaError(Exception):
@@ -64,6 +76,20 @@ class RdmaError(Exception):
 def _seg(handle, length, offset):
     """An RPC-over-RDMA segment: rkey, length, 64 bit remote address."""
     return struct.pack(">IIQ", handle, length, offset)
+
+
+def _encode_private(size):
+    n = (size >> 10) - 1
+    return CMP.pack(CMP_MAGIC, CMP_VERSION, 0, n, n)
+
+
+def _negotiated_inline(private_data, ours):
+    """The largest message we may send inline, from the server's private data."""
+    if private_data and len(private_data) >= CMP.size:
+        magic, version, _flags, _send, recv = CMP.unpack_from(private_data)
+        if magic == CMP_MAGIC and version == CMP_VERSION:
+            return min(ours, (recv + 1) << 10)
+    return MIN_INLINE_SIZE
 
 
 class _Call(object):
@@ -105,22 +131,16 @@ class RdmaPipe(RpcPipe):
     """An RpcPipe that moves records over an RPC-over-RDMA connection."""
 
     def __init__(self, handler, address, recv_slots=RECV_SLOTS,
-                 reply_size=REPLY_CHUNK_SIZE, back_slots=BACK_SLOTS):
+                 reply_size=REPLY_CHUNK_SIZE, back_slots=BACK_SLOTS,
+                 inline_size=INLINE_SIZE):
         # Deliberately not calling Pipe.__init__: there is no socket, no
         # write queue and no polling thread involved.
         try:
-            from pyverbs.cmid import CMID, AddrInfo, ConnParam
-            from pyverbs.qp import QPInitAttr, QPCap
-            from pyverbs.cq import CQ
-            from pyverbs.pd import PD
-            from pyverbs.mr import MR
-            import pyverbs.cm_enums as ce
-            import pyverbs.enums as en
-        except ImportError as e:
-            raise RdmaError("RDMA needs the pyverbs python bindings "
-                            "(python3-pyverbs): %s" % e)
-        self._MR = MR
-        self._en = en
+            verbs.load()
+        except verbs.VerbsError as e:
+            raise RdmaError(str(e))
+        if inline_size % 1024 or inline_size < MIN_INLINE_SIZE:
+            raise RdmaError("inline_size must be a multiple of 1024")
         self._s = None
         self._handler = handler
         self._closed = False            # close() was called
@@ -131,60 +151,64 @@ class RdmaPipe(RpcPipe):
         self._xid = random.randint(0, 0x7fffffff)
         self.set_active()
 
-        host, port = address
-        if isinstance(host, bytes):
-            host = host.decode()
-
-        def addrinfo():
-            return AddrInfo(src=None, dst=host, service=str(port),
-                            port_space=ce.RDMA_PS_TCP, flags=0)
-        # The chunks are registered by us, so they need to be in the same
-        # protection domain as the QP: allocate our own PD on the device and
-        # give it to the CMID.  The first CMID is only used to find the device.
-        self._probe = CMID(creator=addrinfo())
-        ctx = self._probe.context
-        self._pd = PD(ctx)
-        self._cmid = CMID(creator=addrinfo(), pd=self._pd)
-        # pyverbs' CMID.get_*_comp() block in C without dropping the GIL, which
-        # would freeze every other thread, so use our own CQs and poll them.
-        self._scq = CQ(ctx, 16, None, None, 0)
-        self._rcq = CQ(ctx, recv_slots + 4, None, None, 0)
-        cap = QPCap(max_send_wr=4, max_recv_wr=recv_slots + 2,
-                    max_send_sge=1, max_recv_sge=1)
-        self._cmid.create_qp(QPInitAttr(qp_type=2,  # IBV_QPT_RC
-                                        qp_context=None, cap=cap,
-                                        scq=self._scq, rcq=self._rcq))
-        # Receives complete in the order they were posted, and this pyverbs
-        # gives no wr_id, so keep the buffers in a queue to find the right one.
-        self._recv_q = deque()
-        for _ in range(recv_slots):
-            mr = self._cmid.reg_msgs(INLINE_SIZE)
-            self._recv_q.append(mr)
-            self._cmid.post_recv(mr)
-        # post_send() sends the whole MR, so keep one MR per message length
-        self._send_mrs = {}
-        self._send_lock = threading.Lock()
-        self._reply_size = reply_size
-        self._free_reply_mrs = []
-        self._credits = 1               # until the server tells us more
-        self._credit_cv = threading.Condition()
         # Credits.  Every reply and every callback from the server lands in
         # one of our receive buffers, so the calls we may have outstanding
         # (the forward window) are capped to the buffers not kept for
         # callbacks, whatever the server is willing to grant.
+        self._recv_slots = recv_slots
         self._back_slots = back_slots
         self._fwd_slots = recv_slots - back_slots
         if self._fwd_slots < 1:
             raise RdmaError("recv_slots must be larger than back_slots")
+        self._credits = 1               # until the server tells us more
+        self._credit_cv = threading.Condition()
 
-        # Responder resources are how many RDMA Reads the server may have
-        # outstanding against our call chunks.
-        self._cmid.connect(ConnParam(resources=16, depth=1))
-        log_t.info("RDMA connected to %s:%s" % (host, port))
-        self._thread = threading.Thread(target=self._recv_loop,
-                                        name="RdmaRecv")
+        self._reply_size = reply_size
+        self._free_reply_mrs = []
+        self._send_lock = threading.Lock()
+        self._send_event = threading.Event()
+        self._send_status = 0
+        self._conn_lock = threading.Lock()   # connection setup vs teardown
+        self._freed = False
+        self._recv_mrs = []
+        self._send_mr = None
+        self._thread = None
+        self._wake_r, self._wake_w = os.pipe()
+        for fd in (self._wake_r, self._wake_w):
+            verbs._set_nonblocking(fd)
+
+        host, port = address
+        if isinstance(host, bytes):
+            host = host.decode()
+        self._conn = verbs.Connection()
+        try:
+            self._connect(host, port, inline_size)
+        except Exception as e:
+            self._free()
+            if isinstance(e, verbs.VerbsError):
+                raise RdmaError(str(e))
+            raise
+        log_t.info("RDMA connected to %s:%s, inline size %d"
+                   % (host, port, self._inline_send))
+        self._thread = threading.Thread(target=self._event_loop,
+                                        name="RdmaEvents")
         self._thread.daemon = True
         self._thread.start()
+
+    def _connect(self, host, port, inline_size):
+        conn = self._conn
+        conn.resolve(verbs.sockaddr(host, port), 5000)
+        conn.setup_queues(2, self._recv_slots + 2)
+        # Receive buffers are as large as the inline size we offered
+        for i in range(self._recv_slots):
+            mr = verbs.MR(conn.pd, inline_size, verbs.IBV_ACCESS_LOCAL_WRITE)
+            self._recv_mrs.append(mr)
+            conn.post_recv(mr, i)
+        self._send_mr = verbs.MR(conn.pd, inline_size, 0)
+        private = _encode_private(inline_size) \
+            if inline_size > MIN_INLINE_SIZE else None
+        ev = conn.connect(private, RESPONDER_RESOURCES)
+        self._inline_send = _negotiated_inline(ev.private_data, inline_size)
 
     def __getattr__(self, attr):
         # Pipe.__getattr__ would forward to the (absent) socket
@@ -198,14 +222,14 @@ class RdmaPipe(RpcPipe):
 
     # ---- memory registration -------------------------------------------
     def _chunk_mr(self, size, access):
-        en = self._en
-        return self._MR(self._pd, size, en.IBV_ACCESS_LOCAL_WRITE | access)
+        return verbs.MR(self._conn.pd, size,
+                        verbs.IBV_ACCESS_LOCAL_WRITE | access)
 
     def _get_reply_mr(self):
         with self._lock:
             if self._free_reply_mrs:
                 return self._free_reply_mrs.pop()
-        return self._chunk_mr(self._reply_size, self._en.IBV_ACCESS_REMOTE_WRITE)
+        return self._chunk_mr(self._reply_size, verbs.IBV_ACCESS_REMOTE_WRITE)
 
     def _put_reply_mr(self, mr):
         with self._lock:
@@ -221,7 +245,7 @@ class RdmaPipe(RpcPipe):
             msg = (RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._back_slots,
                                  RDMA_MSG) + struct.pack(">III", 0, 0, 0) +
                    record)
-            if len(msg) > INLINE_SIZE:
+            if len(msg) > self._inline_send:
                 raise RdmaError("callback reply does not fit inline")
             self._send(msg)
             return
@@ -236,26 +260,27 @@ class RdmaPipe(RpcPipe):
         try:
             # no write list, and a Reply chunk the size of our buffer
             reply_chunk = (struct.pack(">II", 1, 1) +
-                           _seg(reply_mr.rkey, self._reply_size, reply_mr.buf))
+                           _seg(reply_mr.rkey, self._reply_size,
+                                reply_mr.addr))
             hdr = RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._fwd_slots,
                                 RDMA_MSG)
             tail = struct.pack(">I", 0) + reply_chunk  # write list, reply chunk
             inline = hdr + struct.pack(">I", 0) + tail  # read list is empty
-            if len(inline) + len(record) <= INLINE_SIZE:
+            if len(inline) + len(record) <= self._inline_send:
                 msg = inline + record
             else:
                 call.call_mr = self._chunk_mr(len(record),
-                                              self._en.IBV_ACCESS_REMOTE_READ)
-                call.call_mr.write(record, len(record))
+                                              verbs.IBV_ACCESS_REMOTE_READ)
+                call.call_mr.write(record)
                 # one Read chunk (position 0 == the whole call) and nothing
                 # else inline
                 read_list = (struct.pack(">II", 1, 0) +
                              _seg(call.call_mr.rkey, len(record),
-                                  call.call_mr.buf) + struct.pack(">I", 0))
+                                  call.call_mr.addr) + struct.pack(">I", 0))
                 hdr = RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._fwd_slots,
                                     RDMA_NOMSG)
                 msg = hdr + read_list + tail
-                if len(msg) > INLINE_SIZE:
+                if len(msg) > self._inline_send:
                     raise RdmaError("transport header too large")
             self._send(msg)
         except Exception:
@@ -269,25 +294,23 @@ class RdmaPipe(RpcPipe):
     def _send(self, msg):
         with self._send_lock:
             self._check_alive()
+            if len(msg) > self._inline_send:
+                raise RdmaError("message does not fit the inline size")
+            self._send_mr.write(msg)
+            self._send_event.clear()
             try:
-                mr = self._send_mrs.get(len(msg))
-                if mr is None:
-                    mr = self._send_mrs[len(msg)] = \
-                        self._cmid.reg_msgs(len(msg))
-                mr.write(msg, len(msg))
-                self._cmid.post_send(mr)
-            except Exception as e:
+                self._conn.post_send(self._send_mr, len(msg), SEND_WRID)
+            except verbs.VerbsError as e:
                 self._connection_lost("send failed: %s" % e)
                 self._check_alive()
-            while True:
-                n, wcs = self._scq.poll(1)
-                if n:
-                    break
-                self._check_alive()     # the receive thread may find it first
-                time.sleep(0.0002)
-            if wcs[0].status != 0:
+            # the event thread sets this on the send completion, or when the
+            # connection is lost
+            while not self._send_event.wait(1.0):
+                self._check_alive()
+            self._check_alive()
+            if self._send_status != 0:
                 self._connection_lost("send failed, wc status %d"
-                                      % wcs[0].status)
+                                      % self._send_status)
                 self._check_alive()
 
     def _release(self, xid):
@@ -302,80 +325,70 @@ class RdmaPipe(RpcPipe):
             call.call_mr = None
         return call
 
-    # ---- receiving -----------------------------------------------------
-    def _recv_loop(self):
-        reason = "closed"
-        while not self._closed:
-            try:
-                n, wcs = self._rcq.poll(1)
-            except Exception as e:
-                reason = "receive failed: %s" % e
-                break
-            if n == 0:
-                time.sleep(0.0002)
+    # ---- events --------------------------------------------------------
+    def _wake(self):
+        # under the lock so the fd can not be closed (and its number reused)
+        # while we write to it
+        with self._conn_lock:
+            if not self._freed:
+                try:
+                    os.write(self._wake_w, b"x")
+                except OSError:
+                    pass
+
+    def _event_loop(self):
+        """Handle completions and CM events until the connection is gone."""
+        conn = self._conn
+        poller = select.poll()
+        for fd in (conn.cc_fd, conn.cm_fd, self._wake_r):
+            poller.register(fd, select.POLLIN)
+        try:
+            while self._lost is None:
+                for fd, _ in poller.poll():
+                    if fd == self._wake_r:
+                        try:
+                            os.read(self._wake_r, 64)
+                        except OSError:
+                            pass
+                    elif fd == conn.cm_fd:
+                        self._cm_events()
+                    elif fd == conn.cc_fd:
+                        self._completions()
+        except Exception as e:
+            log_t.warn("RDMA event loop failed", exc_info=True)
+            self._connection_lost("event loop failed: %s" % e)
+        self._teardown()
+
+    def _cm_events(self):
+        while True:
+            ev = self._conn.get_event()
+            if ev is None:
+                return
+            log_t.debug("RDMA CM event %s" % ev)
+            if ev.type in (verbs.CM_DISCONNECTED, verbs.CM_DEVICE_REMOVAL,
+                           verbs.CM_ADDR_CHANGE, verbs.CM_CONNECT_ERROR,
+                           verbs.CM_UNREACHABLE, verbs.CM_REJECTED):
+                self._connection_lost("CM event %s" % ev)
+
+    def _completions(self):
+        for wr_id, status, length in self._conn.completions():
+            if wr_id == SEND_WRID:
+                self._send_status = status
+                self._send_event.set()
                 continue
-            wc = wcs[0]
-            mr = self._recv_q.popleft()
-            if wc.status != 0:
+            if status != 0:
                 # Normally a flush error: the peer disconnected or the QP broke
-                reason = "receive completed with wc status %d" % wc.status
-                break
-            data = mr.read(wc.byte_len, 0)
-            self._cmid.post_recv(mr)         # recycle the buffer
-            self._recv_q.append(mr)
+                self._connection_lost("receive completed with wc status %d"
+                                      % status)
+                continue
+            mr = self._recv_mrs[wr_id]
+            data = mr.read(length)
+            self._conn.post_recv(mr, wr_id)         # recycle the buffer
             try:
                 self._handle_message(data)
             except Exception:
                 log_t.warn("bad RPC-over-RDMA message, dropped",
                            exc_info=True)
-        self._connection_lost(reason)
-        self._teardown()
-
-    def _connection_lost(self, reason):
-        """The connection is gone: refuse new calls, fail the waiting ones.
-
-        Safe to call more than once and from any thread.
-        """
-        with self._credit_cv:
-            if self._lost is not None:
-                return
-            self._lost = reason
-            unanswered = list(self._pending_calls)
-            self._credit_cv.notify_all()      # wake senders waiting for credit
-        if not self._closed:
-            log_t.warn("RDMA connection lost: %s" % reason)
-        self.clear_active()
-        error = RdmaError("RDMA connection lost: %s" % reason)
-        # Only calls whose reply has not arrived; answered ones have already
-        # left _pending_calls and must keep the reply they were given.
-        for xid in unanswered:
-            self._fail(xid, error)
-
-    def _teardown(self):
-        """Free the verbs resources.  Runs once, on the receive thread, after
-        the connection is lost, so nothing is polling the CQs any more."""
-        # Senders check _lost under this lock, so none is using a send MR
-        with self._send_lock:
-            send_mrs, self._send_mrs = list(self._send_mrs.values()), {}
-        with self._credit_cv:
-            calls = list(self._pending_calls.values())
-            self._pending_calls.clear()
-        with self._lock:
-            reply_mrs, self._free_reply_mrs = self._free_reply_mrs, []
-        mrs = list(self._recv_q) + send_mrs + reply_mrs
-        for call in calls:
-            mrs.append(call.reply_mr)
-            if call.call_mr is not None:
-                mrs.append(call.call_mr)
-        self._recv_q.clear()
-        # MRs before the QP, the QP before its CQs, the CQs before the PD
-        closers = mrs + [self._cmid, self._scq, self._rcq, self._pd,
-                         self._probe]
-        for obj in closers:
-            try:
-                obj.close()
-            except Exception:
-                log_t.debug("closing %r failed" % (obj,), exc_info=True)
 
     def _fail(self, xid, error):
         deferred = self._pending.get(xid)
@@ -415,7 +428,7 @@ class RdmaPipe(RpcPipe):
             elif proc == RDMA_NOMSG:
                 if reply_len is None or reply_len > self._reply_size:
                     raise RdmaError("RDMA_NOMSG without a usable Reply chunk")
-                record = call.reply_mr.read(reply_len, 0)
+                record = call.reply_mr.read(reply_len)
             else:
                 raise RdmaError("unexpected RPC-RDMA proc %d" % proc)
         finally:
@@ -439,16 +452,83 @@ class RdmaPipe(RpcPipe):
         t.daemon = True
         t.start()
 
+    # ---- loss and teardown ---------------------------------------------
+    def _connection_lost(self, reason):
+        """The connection is gone: refuse new calls, fail the waiting ones.
+
+        Safe to call more than once and from any thread.
+        """
+        with self._credit_cv:
+            if self._lost is not None:
+                return
+            self._lost = reason
+            unanswered = list(self._pending_calls)
+            self._credit_cv.notify_all()      # wake senders waiting for credit
+        if not self._closed:
+            log_t.warn("RDMA connection lost: %s" % reason)
+        self.clear_active()
+        error = RdmaError("RDMA connection lost: %s" % reason)
+        # Only calls whose reply has not arrived; answered ones have already
+        # left _pending_calls and must keep the reply they were given.
+        for xid in unanswered:
+            self._fail(xid, error)
+        self._send_event.set()                # wake a sender waiting for its
+        self._wake()                          # completion, and the event loop
+
+    def _teardown(self):
+        """Free the verbs resources.  Runs once, on the event thread, after
+        the connection is lost, so nothing is polling the CQ any more."""
+        # Senders check _lost under this lock, so none is using the send MR
+        with self._send_lock:
+            send_mr, self._send_mr = self._send_mr, None
+        with self._credit_cv:
+            calls = list(self._pending_calls.values())
+            self._pending_calls.clear()
+        with self._lock:
+            reply_mrs, self._free_reply_mrs = self._free_reply_mrs, []
+        mrs = self._recv_mrs + [send_mr] + reply_mrs
+        for call in calls:
+            mrs.append(call.reply_mr)
+            if call.call_mr is not None:
+                mrs.append(call.call_mr)
+        self._free(mrs)
+
+    def _free(self, mrs=None):
+        """MRs first, then the QP, the CQ, the PD and the CM id."""
+        if mrs is None:
+            mrs = self._recv_mrs + [self._send_mr] + self._free_reply_mrs
+        with self._conn_lock:
+            if self._freed:
+                return
+            self._freed = True
+            self._conn.disconnect()             # tell the server first
+            for mr in mrs:
+                try:
+                    if mr is not None:
+                        mr.close()
+                except Exception:
+                    log_t.debug("closing a memory region failed",
+                                exc_info=True)
+            self._recv_mrs = []
+            try:
+                self._conn.close()
+            except Exception:
+                log_t.debug("closing the RDMA connection failed",
+                            exc_info=True)
+            for fd in (self._wake_r, self._wake_w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
     def close(self):
         """Close the connection and free everything.  Calls still waiting for
         a reply fail with RdmaError."""
         if self._closed:
             return
         self._closed = True
+        # the event thread sends the disconnect and frees everything
         self._connection_lost("closed")
-        try:
-            self._cmid.disconnect()
-        except Exception:
-            pass
-        if threading.current_thread() is not self._thread:
+        if self._thread is not None and \
+                threading.current_thread() is not self._thread:
             self._thread.join(5.0)      # it frees the resources on its way out

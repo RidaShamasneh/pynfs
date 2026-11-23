@@ -161,7 +161,7 @@ def scan_options(p):
                  help="Try to use 'secure' port number <1024 for client [False]")
     g.add_option("--rdma", action="store_true", default=False,
                  help="Use RPC-over-RDMA instead of TCP, port 20049 unless "
-                 "the server URL gives another one (needs python3-pyverbs) "
+                 "the server URL gives another one (needs librdmacm and libibverbs) "
                  "[False]")
     p.add_option_group(g)
 
