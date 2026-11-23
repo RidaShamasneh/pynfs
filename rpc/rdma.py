@@ -16,6 +16,8 @@ How messages travel:
   * No Write chunks (large READ data comes back in the Reply chunk, copied)
     and no RFC 8797 CM private data (the pyverbs shipped with rdma-core 28
     can not send it), so the inline size stays at the 1024 byte default.
+  * The backchannel works over the same connection: calls from the server
+    arrive as inline RDMA_MSG and are answered with an inline RDMA_MSG.
   * AUTH_NONE/AUTH_SYS are fine, GSS is untested.
 
 Requires the pyverbs python bindings (python3-pyverbs on Debian/Ubuntu).
@@ -192,7 +194,15 @@ class RdmaPipe(RpcPipe):
     # ---- sending -------------------------------------------------------
     def push_record(self, record):
         """Send one RPC call/reply, inline or as a long call."""
-        xid = struct.unpack(">I", record[:4])[0]
+        xid, mtype = struct.unpack(">II", record[:8])
+        if mtype == 1:      # REPLY, to a call the server made (backchannel)
+            msg = (RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._recv_slots,
+                                 RDMA_MSG) + struct.pack(">III", 0, 0, 0) +
+                   record)
+            if len(msg) > INLINE_SIZE:
+                raise RdmaError("callback reply does not fit inline")
+            self._send(msg)
+            return
         with self._credit_cv:
             while len(self._pending_calls) >= self._credits and \
                     not self._closed:
@@ -300,6 +310,12 @@ class RdmaPipe(RpcPipe):
             raise RdmaError("unsupported RPC-RDMA version %d" % vers)
         with self._credit_cv:
             self._credits = max(1, credits)
+        if proc == RDMA_MSG and self._is_call(data):
+            # The server is calling us on the backchannel: same path as a
+            # call arriving over TCP, which sends its reply with push_record
+            pos, _ = _parse_chunk_lists(data, RDMA_HDR.size)
+            self._dispatch(data[pos:])
+            return
         call = self._release(xid)
         if call is None:
             raise RdmaError("reply with unknown xid %#x" % xid)
@@ -321,7 +337,20 @@ class RdmaPipe(RpcPipe):
                 raise RdmaError("unexpected RPC-RDMA proc %d" % proc)
         finally:
             self._put_reply_mr(call.reply_mr)
-        # Same path an incoming TCP record takes, on its own thread
+        self._dispatch(record)
+
+    @staticmethod
+    def _is_call(data):
+        """Is the RPC message after the transport header a CALL?"""
+        try:
+            pos, _ = _parse_chunk_lists(data, RDMA_HDR.size)
+        except RdmaError:
+            return False
+        return len(data) >= pos + 8 and \
+            struct.unpack_from(">I", data, pos + 4)[0] == 0
+
+    def _dispatch(self, record):
+        """Same path an incoming TCP record takes, on its own thread"""
         t = threading.Thread(target=self._handler._event_rpc_record,
                              args=(record, self))
         t.daemon = True
