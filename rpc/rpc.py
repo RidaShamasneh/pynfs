@@ -837,6 +837,16 @@ class ConnectionHandler(object):
         defer.wait()
         return pipe
 
+    def connect_rdma(self, address):
+        """Connect to given address over RPC-over-RDMA, returning new pipe
+
+        Unlike connect(), the pipe is not driven by the polling loop: it has
+        its own receive thread and sends directly.
+        """
+        from .rdma import RdmaPipe
+        log_t.info("Called connect_rdma(%r)" % (address,))
+        return RdmaPipe(self, address)
+
     def bindsocket(self, s, port=1):
         """Scan up through ports, looking for one we can bind to"""
         # This is necessary when we need to use a 'secure' port

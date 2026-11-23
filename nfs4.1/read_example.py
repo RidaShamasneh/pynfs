@@ -3,8 +3,12 @@
 Minimal example: read a file from an NFSv4.1 export using the pynfs library.
 
 Usage (from the nfs4.1 directory, after `python3 setup.py build`):
-    ./read_example.py <server> <path-inside-export> [port]
+    ./read_example.py [--rdma] <server> <path-inside-export> [port]
     ./read_example.py 127.0.0.1 /hello.txt
+    ./read_example.py --rdma 10.9.9.1 /srv/nfs/share/tree/file   # port 20049
+
+--rdma uses RPC-over-RDMA (needs python3-pyverbs).  Only small messages
+work for now: no RDMA chunks, so each call/reply must fit in 1024 bytes.
 
 <path-inside-export> is relative to the server's pseudo-fs root, i.e. the
 same path you would see after mounting the server's root with NFSv4.
@@ -28,12 +32,16 @@ op = nfs_ops.NFS4ops()
 
 
 def main():
-    server = sys.argv[1].encode()
-    path = [c.encode() for c in sys.argv[2].split("/") if c]
-    port = int(sys.argv[3]) if len(sys.argv) > 3 else 2049
+    args = sys.argv[1:]
+    RDMA = "--rdma" in args
+    args = [a for a in args if a != "--rdma"]
+    server = args[0].encode()
+    path = [c.encode() for c in args[1].split("/") if c]
+    port = int(args[2]) if len(args) > 2 else (20049 if RDMA else 2049)
+    chunk = 512 if RDMA else 32768   # RDMA replies must fit inline for now
 
     # 1. Connect and set credentials (AUTH_SYS as the current user)
-    client = nfs4client.NFS4Client(server, port, minorversion=1)
+    client = nfs4client.NFS4Client(server, port, minorversion=1, rdma=RDMA)
     client.set_cred(AuthSys().init_cred(uid=os.getuid(), gid=os.getgid(),
                                         name=b"pynfs-example"))
 
@@ -50,14 +58,14 @@ def main():
                     open_claim4(CLAIM_NULL, name)),
             op.getfh()]
     res = sess.compound(ops)
-    check(res, msg="open %s" % sys.argv[2])
+    check(res, msg="open %s" % args[1])
     stateid = res.resarray[-2].stateid
     fh = res.resarray[-1].object
 
     # 4. READ until EOF
     data, offset = b"", 0
     while True:
-        res = sess.compound([op.putfh(fh), op.read(stateid, offset, 32768)])
+        res = sess.compound([op.putfh(fh), op.read(stateid, offset, chunk)])
         check(res, msg="read")
         r = res.resarray[-1].switch.switch
         data += r.data
@@ -72,6 +80,6 @@ def main():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
+    if len([a for a in sys.argv[1:] if a != "--rdma"]) < 2:
         sys.exit(__doc__)
     main()
