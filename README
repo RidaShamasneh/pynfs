@@ -31,7 +31,8 @@ which will create auto-generated files and compile any shared libraries
 in place.
 
 For more details about 4.0 and 4.1 testing, see nfs4.0/README and
-nfs4.1/README, respectively.  For information about automatic code
+nfs4.1/README, respectively.  The 4.1 code can also talk to a server over
+RDMA (testserver.py --rdma); see "RPC over RDMA" in nfs4.1/README.  For information about automatic code
 generation from an XDR file, see xdr/README.
 
 Note that any server under test must permit connections from high port
