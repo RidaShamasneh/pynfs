@@ -176,6 +176,38 @@ class MR(object):
             _ib.ibv_dereg_mr(mr)
 
 
+def bytes_address(data):
+    """Where the bytes of a bytes object are in memory (CPython keeps them
+    where they are for the life of the object)."""
+    return ctypes.cast(ctypes.c_char_p(data), c_void_p).value
+
+
+class PinnedBytes(MR):
+    """Part of an existing bytes object, registered where it is, not copied.
+
+    The object is kept alive, and must not change, until close()."""
+
+    def __init__(self, pd, data, offset, length, access):
+        if not isinstance(data, bytes) or offset < 0 or \
+                offset + length > len(data):
+            raise VerbsError("not a region of a bytes object")
+        self.size = length
+        self._keep = data
+        self.addr = bytes_address(data) + offset
+        probe = min(length, 16)         # be sure the address is the data's
+        if ctypes.string_at(self.addr, probe) != data[offset:offset + probe]:
+            raise VerbsError("can not find the memory of a bytes object")
+        self._mr = _ib.ibv_reg_mr(pd, self.addr, length, access)
+        if not self._mr:
+            raise _err("ibv_reg_mr(%d bytes in place)" % length)
+        self.lkey = ctypes.c_uint32.from_address(self._mr + _MR_LKEY).value
+        self.rkey = ctypes.c_uint32.from_address(self._mr + _MR_RKEY).value
+
+    def close(self):
+        MR.close(self)
+        self._keep = None
+
+
 class CmEvent(object):
     """A fetched rdma_cm event; the data is copied out and the event acked."""
 

@@ -96,6 +96,59 @@ class ChunkLists(unittest.TestCase):
                        seg(1))
 
 
+class SplitWrite(unittest.TestCase):
+    """Finding the data of a WRITE in the packed call, to send it in place."""
+    PREFIX = b"P" * 40            # stands in for the RPC header and the ops
+    SUFFIX = b"S" * 12            # and for what follows the WRITE
+
+    def packed(self, data, prefix=None, suffix=None):
+        pad = b"\0" * ((-len(data)) % 4)
+        return ((self.PREFIX if prefix is None else prefix) +
+                struct.pack(">I", len(data)) + data + pad +
+                (self.SUFFIX if suffix is None else suffix))
+
+    def test_the_data_is_cut_out_and_can_be_put_back(self):
+        for length in (4096, 4097, 4098, 4099, 100000):
+            data = bytes(range(256)) * (length // 256) + b"x" * (length % 256)
+            record = self.packed(data)
+            position, reduced, chunk = rdma._split_write(record, data)
+            self.assertEqual(position, len(self.PREFIX) + 4)
+            self.assertEqual(chunk, length + (-length) % 4)       # with its pad
+            self.assertEqual(reduced, self.PREFIX + struct.pack(">I", length)
+                             + self.SUFFIX)
+            self.assertEqual(
+                reduced[:position] + record[position:position + chunk] +
+                reduced[position:], record)
+            self.assertEqual(position % 4, 0)
+
+    def test_the_pad_travels_with_the_data(self):
+        data = b"abcde"                                  # 3 bytes of pad
+        record = self.packed(data)
+        position, _, chunk = rdma._split_write(record, data)
+        self.assertEqual(record[position:position + chunk], b"abcde\0\0\0")
+
+    def test_not_found_means_none(self):
+        self.assertIsNone(rdma._split_write(self.packed(b"abcdefgh"),
+                                            b"zzzzzzzz"))
+
+    def test_data_that_appears_twice_is_not_certain(self):
+        data = b"twice!!!"
+        record = self.packed(data, suffix=struct.pack(">I", 8) + data)
+        self.assertIsNone(rdma._split_write(record, data))
+
+    def test_a_cut_off_call_means_none(self):
+        data = b"abcde"
+        record = self.packed(data, suffix=b"")[:-1]      # the pad is not all there
+        self.assertIsNone(rdma._split_write(record, data))
+
+    def test_a_pad_that_is_not_zeros_means_none(self):
+        data = b"abcde"
+        record = self.packed(data)
+        at = record.find(data) + len(data)
+        record = record[:at] + b"\1" + record[at + 1:]
+        self.assertIsNone(rdma._split_write(record, data))
+
+
 class RecordWithPayload(unittest.TestCase):
     def test_the_payload_survives_cutting_off_the_header(self):
         rec = rdma.RecordWithPayload(b"0123456789", b"DATA")

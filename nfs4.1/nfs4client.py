@@ -185,6 +185,10 @@ class NFS4Client(rpc.Client, rpc.Server):
             reads = [a for a in ops if a.argop == OP_READ]
             if len(reads) == 1:
                 hints["read_size"] = reads[0].opread.count
+            # A WRITE alone in its COMPOUND can have its data sent in place
+            writes = [a for a in ops if a.argop == OP_WRITE]
+            if len(writes) == 1 and isinstance(writes[0].opwrite.data, bytes):
+                hints["write_data"] = writes[0].opwrite.data
             # ... and how big a Reply chunk it needs for the rest
             bound = reply_bound(ops, tag, len(reads) == 1)
             if bound is not None:

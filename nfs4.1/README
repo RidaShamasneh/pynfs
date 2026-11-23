@@ -83,8 +83,17 @@ RPC over RDMA
   * Connection setup sends the RFC 8797 private data and takes the server's
     answer to size what can go inline: 4096 bytes with nfsd, 1024 if the
     server sends none.
-  * A call that fits is one RDMA_MSG.  A bigger one goes as RDMA_NOMSG with
-    the whole call in a Position Zero Read chunk, which the server reads.
+  * A call that fits is one RDMA_MSG.  A bigger one that is mostly the data
+    of a single WRITE goes as an RDMA_MSG without that data, plus a Read chunk
+    at the position where the data belongs (RFC 8166, RFC 8267).  The data,
+    with its XDR pad, is registered where it already is in the packed call,
+    not copied, and the server reads just that into its own buffers.
+    NFS4Client passes the data as the write_data hint, only for AUTH_NONE or
+    AUTH_SYS and only for a COMPOUND with one WRITE.  If the transport is not
+    sure where the data is, or it does not all fit, or memory can not be
+    registered, the call goes the way any other big call does:
+    as RDMA_NOMSG with the whole call in a Position Zero Read chunk, copied
+    to a registered buffer, which the server reads.
   * Every call carries a Reply chunk, for a reply that does not fit inline.
     Its size comes from the call: NFS4Client bounds the reply from the ops
     (nfs4client.reply_bound) and the session's maximum response size caps
@@ -119,10 +128,16 @@ RPC over RDMA
 
   LIMITATIONS
   ===========
-  * Large WRITEs are copied into one registered buffer; there are no
-    Position-nonzero Read chunks.  READ_PLUS, several READs in one COMPOUND
-    and big READDIR/READLINK/GETXATTR results come back through the Reply
-    chunk, copied.
+  * Only one WRITE per COMPOUND can be sent in place; a COMPOUND with
+    several big ones, or any other big call (SETXATTR, SETATTR with a big
+    ACL), is copied into one registered buffer.  (A Linux nfsd stores the
+    second of two big WRITEs in one COMPOUND wrongly even over TCP.)
+    READ_PLUS, several READs in one COMPOUND and big
+    READDIR/READLINK/GETXATTR results come back through the Reply chunk,
+    copied.
+  * "In place" avoids copying the data into a second registered buffer.
+    The packer still builds the call in Python, so this is not zero-copy
+    from the application.
   * Callbacks, and the replies to them, must fit inline.
   * No reconnect and no keepalive: a peer that vanishes without
     disconnecting is only noticed when the next send fails.
@@ -151,8 +166,9 @@ RPC over RDMA
   honours Write chunks, as a Linux nfsd does.
 
       test_data.py          data of every size survives, inline, in Read,
-                            Reply and Write chunks (including odd lengths
-                            and results after the READ)
+                            Reply and Write chunks, and WRITE data sent in
+                            place (including odd lengths and results after
+                            the READ or WRITE)
       test_chunk_sizes.py   which chunk buffers each kind of call registers
       test_connections.py   extra connections and several sessions; leaks
       test_memory.py        little lockable memory (lowers RLIMIT_MEMLOCK

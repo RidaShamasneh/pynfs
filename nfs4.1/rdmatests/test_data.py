@@ -1,8 +1,10 @@
 """Data survives the trip: inline, in Read chunks, Reply chunks and Write
 chunks (needs a server)."""
 import os
+from unittest import mock
 
-from .common import RdmaServerTest, op, ANY_STATEID, FATTR4_SIZE, OP_READ, check
+from .common import (RdmaServerTest, op, rdma, ANY_STATEID, FATTR4_SIZE,
+                     OP_READ, FILE_SYNC4, check)
 
 
 class WriteRead(RdmaServerTest):
@@ -89,6 +91,90 @@ class WriteChunks(RdmaServerTest):
                if r.resop == OP_READ]
         self.assertEqual(got, [self.data[:9000], self.data[9000:18001]])
         self.assertEqual(self.pipe.write_chunk_bytes, before)
+
+
+class WriteInPlace(RdmaServerTest):
+    """A WRITE too big to go inline is sent with a Read chunk at the position
+    of its data, registered where it is in the call, not copied.
+
+    These assert that the data went that way, which a Linux nfsd accepts.
+    """
+    def setUp(self):
+        super(WriteInPlace, self).setUp()
+        self.sess = self.new_session(max_request=1048576 + 8192)
+        self.pipe = self.sess.c.c1
+        self.fh = self.create_file(self.sess)           # empty
+        self.maxwrite = self.sess.fore_channel.maxrequestsize - 4096
+
+    def write(self, offset, data, extra=()):
+        res = self.sess.compound([op.putfh(self.fh), op.write(
+            self.sess_stateid(), offset, FILE_SYNC4, data)] + list(extra))
+        check(res, msg="write")
+        return res
+
+    def sess_stateid(self):
+        return ANY_STATEID
+
+    def test_big_writes_are_sent_in_place(self):
+        # not multiples of 4 too: the pad goes with the data
+        for size in (5000, 5001, 5002, 5003, 60000, 100001, 500003):
+            if size > self.maxwrite:
+                continue
+            data = os.urandom(size)
+            before = self.pipe.in_place_write_bytes
+            self.write(0, data)
+            self.assertEqual(self.pipe.in_place_write_bytes - before, size)
+            self.assertEqual(self.read_all(self.sess, self.fh), data, size)
+
+    def test_a_write_that_fits_inline_is_not(self):
+        before = self.pipe.in_place_write_bytes
+        self.write(0, b"small")
+        self.assertEqual(self.pipe.in_place_write_bytes, before)
+        self.assertEqual(self.read_all(self.sess, self.fh), b"small")
+
+    def test_the_largest_write_the_session_allows(self):
+        size = min(self.maxwrite, 1000000)
+        if size < 200000:
+            self.skipTest("the server allows writes of only %d bytes" % size)
+        data = os.urandom(size)
+        self.write(0, data)
+        self.assertEqual(self.pipe.in_place_write_bytes, size)
+        self.assertEqual(self.read_all(self.sess, self.fh), data)
+
+    def test_a_result_after_the_write_still_lines_up(self):
+        data = os.urandom(70003)
+        res = self.write(0, data, [op.getattr(1 << FATTR4_SIZE)])
+        self.assertEqual(res.resarray[-1].obj_attributes[FATTR4_SIZE], 70003)
+        self.assertEqual(self.read_all(self.sess, self.fh), data)
+
+    def test_data_that_repeats_itself(self):
+        for data in (b"abcd" * 25000, b"\0" * 100000, b"ab" * 50001):
+            self.write(0, data)
+            self.assertEqual(self.read_all(self.sess, self.fh)[:len(data)],
+                             data)
+
+    def test_two_writes_in_one_compound_are_not(self):
+        """Which data would go in place is not clear, so the call goes as a
+        long call, copied.  (Only the first write's data is checked: a Linux
+        nfsd stores the second of two big WRITEs in one COMPOUND wrongly even
+        over TCP.)"""
+        a, b = os.urandom(50000), os.urandom(50000)
+        before = self.pipe.in_place_write_bytes
+        check(self.sess.compound([
+            op.putfh(self.fh), op.write(ANY_STATEID, 0, FILE_SYNC4, a),
+            op.write(ANY_STATEID, 50000, FILE_SYNC4, b)]), msg="two writes")
+        self.assertEqual(self.pipe.in_place_write_bytes, before)
+        self.assertEqual(self.read_all(self.sess, self.fh)[:50000], a)
+
+    def test_when_the_data_cannot_be_placed_the_call_is_a_long_call(self):
+        """If the transport is not sure where the data is (see SplitWrite in
+        test_transport_units), the call goes as a long call instead."""
+        data = os.urandom(70000)
+        before = self.pipe.in_place_write_bytes
+        with mock.patch.object(rdma, "_split_write", lambda r, d: None):
+            self.write(0, data)
+        self.assertEqual(self.pipe.in_place_write_bytes, before)
+        self.assertEqual(self.read_all(self.sess, self.fh), data)
 
 
 class LargeReply(RdmaServerTest):

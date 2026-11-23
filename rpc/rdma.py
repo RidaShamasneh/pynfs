@@ -11,9 +11,14 @@ How messages travel:
     inline buffers, and takes the server's answer to size what we may send
     inline (1024 when the server sends none).
   * A call that fits the inline size goes in a single RDMA_MSG.
-  * A larger call goes as RDMA_NOMSG with the whole RPC call in a Position
-    Zero Read chunk: the call is copied to a registered buffer and the server
-    RDMA Reads it (RFC 8166 section 4.3, a "long call").
+  * A larger call that is mostly the data of one WRITE (the write_data hint
+    of push_record()) goes as an RDMA_MSG without that data, plus a Read
+    chunk at the position where the data belongs (RFC 8166 section 4.3,
+    RFC 8267): the data is registered where it already is in the call, not
+    copied, and the server RDMA Reads just that into its own buffers.
+  * Any other larger call goes as RDMA_NOMSG with the whole RPC call in a
+    Position Zero Read chunk: the call is copied to a registered buffer and
+    the server RDMA Reads it (a "long call").
   * Every call carries a Reply chunk, a registered buffer the server RDMA
     Writes a reply into if it does not fit inline (a "long reply").  The
     reply then arrives as RDMA_NOMSG and the data is taken from that buffer.
@@ -111,6 +116,28 @@ def _negotiated_inline(private_data, ours):
         if magic == CMP_MAGIC and version == CMP_VERSION:
             return (min(ours, (recv + 1) << 10), min(ours, (send + 1) << 10))
     return MIN_INLINE_SIZE, MIN_INLINE_SIZE
+
+
+def _split_write(record, data):
+    """Where the data of a WRITE sits in the packed call, or None if that is
+    not certain.
+
+    Returns (position of the data, the call without the data and its XDR pad,
+    the length of the data with its pad).  XDR puts the pad right after the
+    data, and a Read chunk carries it with the data (RFC 8166 section 3.4.5),
+    so the chunk is a slice of the call as it is.
+    """
+    length = len(data)
+    pad = (-length) % 4
+    needle = struct.pack(">I", length) + data       # the opaque, as packed
+    at = record.find(needle)
+    if at < 0 or record.find(needle, at + 1) >= 0:  # not there, or not unique
+        return None
+    start = at + 4
+    end = start + length + pad
+    if end > len(record) or record[start + length:end] != b"\0" * pad:
+        return None
+    return start, record[:start] + record[end:], length + pad
 
 
 class RecordWithPayload(bytes):
@@ -215,6 +242,7 @@ class RdmaPipe(RpcPipe):
         self._reply_size = self._clamp_reply_size(reply_size)
         self._free_mrs = {}             # size -> idle Reply/Write chunk buffers
         self.write_chunk_bytes = 0      # READ data received in Write chunks
+        self.in_place_write_bytes = 0   # WRITE data sent in place
         self._shrink_warned = False
         self._send_lock = threading.Lock()
         self._send_event = threading.Event()
@@ -349,7 +377,7 @@ class RdmaPipe(RpcPipe):
 
     # ---- sending -------------------------------------------------------
     def push_record(self, record, read_size=None, reply_size=None,
-                    max_reply=None):
+                    max_reply=None, write_data=None):
         """Send one RPC call/reply, inline or as a long call.
 
         read_size says the call has one READ of that many bytes: a big enough
@@ -363,6 +391,10 @@ class RdmaPipe(RpcPipe):
         max_reply is the most the call's session allows as a reply; it is
         what the Reply chunk may grow to.  Without it, whatever
         set_reply_size() last said, for the whole pipe.
+
+        write_data is the data of the one WRITE in the call: if the call is
+        too big to go inline, it is sent in place with a Read chunk at that
+        position, not copied.
         """
         self._check_alive()
         cap = self._reply_size if max_reply is None else \
@@ -433,9 +465,12 @@ class RdmaPipe(RpcPipe):
                                 RDMA_MSG)
             tail = write_list + reply_chunk
             inline = hdr + struct.pack(">I", 0) + tail  # read list is empty
+            msg = None
             if len(inline) + len(record) <= self._inline_send:
                 msg = inline + record
-            else:
+            elif write_data is not None:
+                msg = self._write_in_place(call, xid, record, write_data, tail)
+            if msg is None:
                 try:
                     try:
                         call.call_mr = self._chunk_mr(
@@ -468,6 +503,43 @@ class RdmaPipe(RpcPipe):
                     if mr is not None:
                         self._put_mr(mr)
             raise
+
+    def _write_in_place(self, call, xid, record, data, tail):
+        """The message for a call whose WRITE data is sent in a Read chunk at
+        its position, or None if that is not possible (the data is not where
+        it should be, the rest does not fit inline, no memory to register):
+        then the call goes as a long call."""
+        split = _split_write(record, data)
+        if split is None:
+            return None
+        position, reduced, chunk_length = split
+        if len(tail) + len(reduced) + 16 + 28 > self._inline_send:
+            return None
+        try:
+            try:
+                mr = verbs.PinnedBytes(self._conn.pd, record, position,
+                                       chunk_length,
+                                       verbs.IBV_ACCESS_REMOTE_READ)
+            except verbs.VerbsError:
+                if not self._reclaim_idle():
+                    raise
+                mr = verbs.PinnedBytes(self._conn.pd, record, position,
+                                       chunk_length,
+                                       verbs.IBV_ACCESS_REMOTE_READ)
+        except verbs.VerbsError as e:
+            log_t.debug("registering the data in place failed: %s" % e)
+            return None
+        read_list = (struct.pack(">II", 1, position) +
+                     _seg(mr.rkey, chunk_length, mr.addr) +
+                     struct.pack(">I", 0))
+        msg = (RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._fwd_slots,
+                             RDMA_MSG) + read_list + tail + reduced)
+        if len(msg) > self._inline_send:
+            mr.close()
+            return None
+        call.call_mr = mr
+        self.in_place_write_bytes += len(data)
+        return msg
 
     def _check_alive(self):
         if self._lost is not None:
