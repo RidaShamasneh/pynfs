@@ -493,6 +493,10 @@ class SessionRecord(object):
         self.cred = client.cred
         self.fore_channel = SendChannel(csr.csr_fore_chan_attrs)
         self.back_channel = RecvChannel(csr.csr_back_chan_attrs)
+        # An RDMA transport sizes its Reply chunks from what the server may send
+        set_reply_size = getattr(client.c.c1, "set_reply_size", None)
+        if set_reply_size:
+            set_reply_size(self.fore_channel.maxresponsesize)
         # STUB - and other stuff
 
     def seq_op(self, slot=None, seq_delta=1, cache_this=False):
