@@ -26,6 +26,52 @@ log_cb = logging.getLogger("nfs.client.cb")
 op4 = nfs_ops.NFS4ops()
 SHOW_TRAFFIC = 0
 
+# Ops whose results are small, a few hundred bytes at most
+_SMALL_REPLY_OPS = set(
+    globals()["OP_" + name] for name in (
+        "PUTFH PUTROOTFH PUTPUBFH GETFH SAVEFH RESTOREFH LOOKUP LOOKUPP OPEN "
+        "OPEN_DOWNGRADE CLOSE ACCESS COMMIT CREATE DELEGPURGE DELEGRETURN LINK "
+        "LOCK LOCKT LOCKU NVERIFY VERIFY REMOVE RENAME RENEW SETATTR WRITE "
+        "SEQUENCE RECLAIM_COMPLETE DESTROY_SESSION DESTROY_CLIENTID "
+        "FREE_STATEID EXCHANGE_ID CREATE_SESSION BACKCHANNEL_CTL "
+        "BIND_CONN_TO_SESSION SECINFO SECINFO_NO_NAME SET_SSV ALLOCATE "
+        "DEALLOCATE SEEK LAYOUTRETURN LAYOUTCOMMIT WANT_DELEGATION"
+        .split()) if "OP_" + name in globals())
+# Attributes whose values can be large
+_BIG_ATTRS = sum(1 << globals()[n] for n in (
+    "FATTR4_ACL", "FATTR4_DACL", "FATTR4_SACL", "FATTR4_FS_LOCATIONS",
+    "FATTR4_FS_LOCATIONS_INFO", "FATTR4_SEC_LABEL") if n in globals())
+
+def reply_bound(ops, tag, read_data_elsewhere):
+    """An upper bound for the size of the reply to a COMPOUND, or None if there
+    is no useful one.  An RDMA transport sizes the Reply chunk with it, since
+    the most a session allows is far more than most replies need.
+
+    read_data_elsewhere: the data of a READ comes some other way (an RDMA Write
+    chunk), so it is not counted.  Wrong guesses are not an option, a reply
+    that does not fit fails the call: whatever is not known here is None.
+    """
+    try:
+        total = 1024 + len(tag)         # RPC and COMPOUND headers, the tag
+        for a in ops:
+            if a.argop in _SMALL_REPLY_OPS:
+                total += 512
+            elif a.argop == OP_GETATTR:
+                if a.opgetattr.attr_request & _BIG_ATTRS:
+                    return None
+                total += 2048
+            elif a.argop == OP_READ:
+                total += 512 + (0 if read_data_elsewhere else a.opread.count)
+            elif a.argop == OP_READDIR:
+                total += 512 + a.opreaddir.maxcount
+            elif a.argop == OP_READLINK:
+                total += 512 + 8192
+            else:
+                return None
+        return total
+    except Exception:
+        return None
+
 class NFS4Client(rpc.Client, rpc.Server):
     def __init__(self, host=b'localhost', port=2049, minorversion=2, ctrl_proc=16, summary=None, secure=False, rdma=False):
         self.rdma = rdma
@@ -102,6 +148,10 @@ class NFS4Client(rpc.Client, rpc.Server):
             reads = [a for a in ops if a.argop == OP_READ]
             if len(reads) == 1:
                 hints["read_size"] = reads[0].opread.count
+            # ... and how big a Reply chunk it needs for the rest
+            bound = reply_bound(ops, tag, len(reads) == 1)
+            if bound is not None:
+                hints["reply_size"] = bound
         return self.send_call(pipe, 1, p.get_buffer(), credinfo, **hints)
 
     def compound(self, *args, **kwargs):

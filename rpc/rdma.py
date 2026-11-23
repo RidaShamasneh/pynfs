@@ -18,7 +18,14 @@ How messages travel:
     Writes a reply into if it does not fit inline (a "long reply").  The
     reply then arrives as RDMA_NOMSG and the data is taken from that buffer.
     An NFSv4.1 server never sends more than the session's maximum response
-    size, so set_reply_size() sizes the chunk from it (64 KB to 4 MB).
+    size, so set_reply_size() sets that as the largest chunk (64 KB to 4 MB).
+    A call that says how big its reply can be (the reply_size hint) gets a
+    chunk of just that size, 64 KB at least, so ordinary calls pin little.
+    nfsd wants the Reply chunk to hold the whole reply, READ data included,
+    even when the data goes in a Write chunk (a smaller one makes it drop the
+    connection), so the READ count is part of the size.  When the reply
+    without the READ data is known to fit inline, as for a READ with only a
+    few small ops around it, there is no Reply chunk at all.
   * A READ can have its data placed by the server straight into a Write
     chunk (RFC 8166 section 4.4, RFC 8267), instead of coming back through
     the Reply chunk.  The caller says so with the read_size hint of
@@ -63,7 +70,10 @@ REPLY_CHUNK_SIZE = 64 * 1024    # smallest Reply chunk (see set_reply_size)
 MAX_REPLY_CHUNK_SIZE = 4 * 1024 * 1024   # and the largest
 REPLY_SLACK = 4096      # room above the session's maximum response size
 WRITE_CHUNK_MIN = 2048  # READs larger than this get a Write chunk
-WRITE_POOL_BYTES = 4 * 1024 * 1024   # most memory idle Write chunk buffers pin
+INLINE_HDR_ALLOWANCE = 128      # for the transport header of an inline reply
+POOL_BYTES = 4 * 1024 * 1024    # most memory idle pooled buffers pin
+SIZE_CLASS_STEP = 64 * 1024     # pooled buffers: powers of two up to this,
+                                # then multiples of it
 RESPONDER_RESOURCES = 16        # RDMA Reads the server may have outstanding
 RDMA_HDR = struct.Struct(">IIII")      # xid, vers, credits, proc
 
@@ -94,12 +104,13 @@ def _encode_private(size):
 
 
 def _negotiated_inline(private_data, ours):
-    """The largest message we may send inline, from the server's private data."""
+    """(the largest message we may send inline, the largest the server will
+    send us inline), from the server's private data."""
     if private_data and len(private_data) >= CMP.size:
-        magic, version, _flags, _send, recv = CMP.unpack_from(private_data)
+        magic, version, _flags, send, recv = CMP.unpack_from(private_data)
         if magic == CMP_MAGIC and version == CMP_VERSION:
-            return min(ours, (recv + 1) << 10)
-    return MIN_INLINE_SIZE
+            return (min(ours, (recv + 1) << 10), min(ours, (send + 1) << 10))
+    return MIN_INLINE_SIZE, MIN_INLINE_SIZE
 
 
 class RecordWithPayload(bytes):
@@ -125,7 +136,7 @@ class RecordWithPayload(bytes):
 class _Call(object):
     """Registered memory belonging to one call that is waiting for its reply."""
     def __init__(self, reply_mr, call_mr=None):
-        self.reply_mr = reply_mr    # the Reply chunk
+        self.reply_mr = reply_mr    # the Reply chunk, None if there is none
         self.call_mr = call_mr      # the Position Zero Read chunk, if any
         self.write_mr = None        # the Write chunk for a READ, if any
 
@@ -202,8 +213,7 @@ class RdmaPipe(RpcPipe):
         self._credit_cv = threading.Condition()
 
         self._reply_size = self._clamp_reply_size(reply_size)
-        self._free_reply_mrs = []
-        self._free_write_mrs = {}       # buffer size -> idle Write chunks
+        self._free_mrs = {}             # size -> idle Reply/Write chunk buffers
         self.write_chunk_bytes = 0      # READ data received in Write chunks
         self._shrink_warned = False
         self._send_lock = threading.Lock()
@@ -249,7 +259,8 @@ class RdmaPipe(RpcPipe):
         private = _encode_private(inline_size) \
             if inline_size > MIN_INLINE_SIZE else None
         ev = conn.connect(private, RESPONDER_RESOURCES)
-        self._inline_send = _negotiated_inline(ev.private_data, inline_size)
+        self._inline_send, self._inline_reply = \
+            _negotiated_inline(ev.private_data, inline_size)
 
     def __getattr__(self, attr):
         # Pipe.__getattr__ would forward to the (absent) socket
@@ -270,96 +281,83 @@ class RdmaPipe(RpcPipe):
     def _clamp_reply_size(size):
         return max(REPLY_CHUNK_SIZE, min(size, MAX_REPLY_CHUNK_SIZE))
 
+    @staticmethod
+    def _size_class(size):
+        """Pooled buffers come in a few sizes so idle ones can be reused."""
+        if size <= SIZE_CLASS_STEP:
+            return 1 << max(12, (size - 1).bit_length())
+        return (size + SIZE_CLASS_STEP - 1) & ~(SIZE_CLASS_STEP - 1)
+
     def set_reply_size(self, max_response_size):
-        """Size the Reply chunks of later calls for replies up to
-        max_response_size bytes (an NFSv4.1 session's ca_maxresponsesize)."""
+        """Set the largest Reply chunk, and the size of those of calls that do
+        not say how big their reply can be, to the session's maximum response
+        size (ca_maxresponsesize)."""
         size = self._clamp_reply_size(max_response_size + REPLY_SLACK)
         with self._lock:
             if size == self._reply_size:
                 return
             self._reply_size = size
-            stale, self._free_reply_mrs = self._free_reply_mrs, []
-        for mr in stale:
-            mr.close()
         log_t.info("RDMA Reply chunk size is now %d" % size)
 
-    def _reclaim_idle(self, replies=True):
+    def _reclaim_idle(self):
         """Unpin the idle pooled buffers, to make room.  True if any."""
         with self._lock:
-            mrs = [mr for idle in self._free_write_mrs.values() for mr in idle]
-            self._free_write_mrs = {}
-            if replies:
-                mrs += self._free_reply_mrs
-                self._free_reply_mrs = []
+            mrs = [mr for idle in self._free_mrs.values() for mr in idle]
+            self._free_mrs = {}
         for mr in mrs:
             mr.close()
         return bool(mrs)
 
-    def _try_reply_mr(self, shrink=False):
-        """A Reply chunk of the current size, or None if the memory can not
-        be registered right now (RLIMIT_MEMLOCK).  With shrink, a smaller
-        chunk (down to REPLY_CHUNK_SIZE) is accepted: a big reply may then
-        fail, but ordinary calls keep working."""
-        with self._lock:
-            if self._free_reply_mrs:
-                return self._free_reply_mrs.pop()
-            size = self._reply_size
+    def _get_mr(self, size, shrink=False):
+        """A remote-writable buffer, for a Reply or a Write chunk, of at
+        least size bytes; None if the memory can not be registered right now
+        (RLIMIT_MEMLOCK).  With shrink, a smaller one (down to
+        REPLY_CHUNK_SIZE) is accepted: a big reply may then fail, but
+        ordinary calls keep working."""
+        wanted = size = self._size_class(size)
         reclaimed = False
         while True:
+            with self._lock:
+                idle = self._free_mrs.get(size)
+                if idle:
+                    return idle.pop()
             try:
                 mr = self._chunk_mr(size, verbs.IBV_ACCESS_REMOTE_WRITE)
-                if size != self._reply_size and not self._shrink_warned:
+                if size < wanted and not self._shrink_warned:
                     self._shrink_warned = True
-                    log_t.warn("RDMA Reply chunk limited to %d bytes, not %d: "
-                               "RLIMIT_MEMLOCK is too low" %
-                               (size, self._reply_size))
+                    log_t.warn("RDMA chunk limited to %d bytes, not %d: "
+                               "RLIMIT_MEMLOCK is too low" % (size, wanted))
                 return mr
             except verbs.VerbsError as e:
-                log_t.debug("Reply chunk registration failed: %s" % e)
-                if not reclaimed and self._reclaim_idle(replies=False):
-                    reclaimed = True        # idle Write chunks were in the way
+                log_t.debug("chunk registration failed: %s" % e)
+                if not reclaimed and self._reclaim_idle():
+                    reclaimed = True        # idle buffers were in the way
                     continue
                 if not shrink or size <= REPLY_CHUNK_SIZE:
                     return None
-                size = max(REPLY_CHUNK_SIZE, size // 2)
+                size = self._size_class(max(REPLY_CHUNK_SIZE, size // 2))
 
-    def _get_write_mr(self, size):
-        """A Write chunk buffer for size bytes, or None if there is no memory.
-        Buffers are rounded up to a power of two so they can be reused."""
-        cap = 1 << max(12, (size - 1).bit_length())
+    def _put_mr(self, mr):
+        """Give a buffer back to the pool, if there is room for it."""
         with self._lock:
-            idle = self._free_write_mrs.get(cap)
-            if idle:
-                return idle.pop()
-        try:
-            return self._chunk_mr(cap, verbs.IBV_ACCESS_REMOTE_WRITE)
-        except verbs.VerbsError as e:
-            log_t.debug("Write chunk registration failed: %s" % e)
-            return None
-
-    def _put_write_mr(self, mr):
-        with self._lock:
-            pinned = sum(m.size for idle in self._free_write_mrs.values()
+            pinned = sum(m.size for idle in self._free_mrs.values()
                          for m in idle)
-            if pinned + mr.size <= WRITE_POOL_BYTES and not self._freed:
-                self._free_write_mrs.setdefault(mr.size, []).append(mr)
+            if pinned + mr.size <= POOL_BYTES and not self._freed:
+                self._free_mrs.setdefault(mr.size, []).append(mr)
                 return
         mr.close()
 
-    def _put_reply_mr(self, mr):
-        with self._lock:
-            if mr.size == self._reply_size and not self._freed:
-                self._free_reply_mrs.append(mr)
-                return
-        mr.close()          # sized for an older session, or shutting down
-
     # ---- sending -------------------------------------------------------
-    def push_record(self, record, read_size=None):
+    def push_record(self, record, read_size=None, reply_size=None):
         """Send one RPC call/reply, inline or as a long call.
 
         read_size says the call has one READ of that many bytes: a big enough
         one gets a Write chunk, so the server places the data directly in
         our memory.  Only for a reply the server could ever send.
+
+        reply_size is an upper bound for the reply, READ data not counted if
+        there is a read_size: the Reply chunk is sized for it.  Without it
+        the Reply chunk can take anything the session allows.
         """
         self._check_alive()
         xid, mtype = struct.unpack(">II", record[:8])
@@ -378,12 +376,30 @@ class RdmaPipe(RpcPipe):
                 self._credit_cv.wait(1.0)
             self._check_alive()
             while True:
+                # A Write chunk for the READ data, if it is worth it
+                write_mr = None
+                if read_size and WRITE_CHUNK_MIN < read_size <= self._reply_size:
+                    write_mr = self._get_mr(read_size)
+                reply_mr = None
+                if write_mr is not None and reply_size is not None and \
+                        reply_size <= self._inline_reply - INLINE_HDR_ALLOWANCE:
+                    # The reply without the READ data fits inline: no Reply
+                    # chunk, so nothing more to pin.
+                    break
+                # A Reply chunk for the whole reply, READ data included
+                want = self._reply_size
+                if reply_size is not None:
+                    want = max(REPLY_CHUNK_SIZE, min(
+                        reply_size + (read_size or 0) + REPLY_SLACK,
+                        self._reply_size))
                 # Out of lockable memory: wait for a call in flight to
-                # finish and give its buffer back.  If there is none, make do
+                # finish and give its buffers back.  If there is none, make do
                 # with a smaller chunk
-                reply_mr = self._try_reply_mr(shrink=not self._pending_calls)
+                reply_mr = self._get_mr(want, shrink=not self._pending_calls)
                 if reply_mr is not None:
                     break
+                if write_mr is not None:
+                    self._put_mr(write_mr)
                 if not self._pending_calls:
                     raise RdmaError("cannot register a %d byte Reply chunk "
                                     "(RLIMIT_MEMLOCK too low?)"
@@ -391,21 +407,22 @@ class RdmaPipe(RpcPipe):
                 self._credit_cv.wait(1.0)
                 self._check_alive()
             call = _Call(reply_mr)
+            call.write_mr = write_mr
             self._pending_calls[xid] = call
         try:
             # a Reply chunk the size of our buffer, and a Write chunk for READ
             # data if there is one (XDR rounds the data up to a multiple of 4)
-            reply_chunk = (struct.pack(">II", 1, 1) +
-                           _seg(reply_mr.rkey, reply_mr.size, reply_mr.addr))
+            reply_chunk = struct.pack(">I", 0)
+            if reply_mr is not None:
+                reply_chunk = (struct.pack(">II", 1, 1) +
+                               _seg(reply_mr.rkey, reply_mr.size,
+                                    reply_mr.addr))
             write_list = struct.pack(">I", 0)
-            if read_size and WRITE_CHUNK_MIN < read_size <= reply_mr.size:
-                call.write_mr = self._get_write_mr(read_size)
-                if call.write_mr is not None:
-                    write_list = (struct.pack(">II", 1, 1) +
-                                  _seg(call.write_mr.rkey,
-                                       (read_size + 3) & ~3,
-                                       call.write_mr.addr) +
-                                  struct.pack(">I", 0))
+            if call.write_mr is not None:
+                write_list = (struct.pack(">II", 1, 1) +
+                              _seg(call.write_mr.rkey, (read_size + 3) & ~3,
+                                   call.write_mr.addr) +
+                              struct.pack(">I", 0))
             hdr = RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._fwd_slots,
                                 RDMA_MSG)
             tail = write_list + reply_chunk
@@ -441,9 +458,9 @@ class RdmaPipe(RpcPipe):
         except Exception:
             call = self._release(xid)
             if call is not None:
-                self._put_reply_mr(call.reply_mr)
-                if call.write_mr is not None:
-                    self._put_write_mr(call.write_mr)
+                for mr in (call.reply_mr, call.write_mr):
+                    if mr is not None:
+                        self._put_mr(mr)
             raise
 
     def _check_alive(self):
@@ -594,15 +611,16 @@ class RdmaPipe(RpcPipe):
             if proc == RDMA_MSG:
                 record = data[pos:]
             elif proc == RDMA_NOMSG:
-                if reply_len is None or reply_len > call.reply_mr.size:
+                if call.reply_mr is None or reply_len is None or \
+                        reply_len > call.reply_mr.size:
                     raise RdmaError("RDMA_NOMSG without a usable Reply chunk")
                 record = call.reply_mr.read(reply_len)
             else:
                 raise RdmaError("unexpected RPC-RDMA proc %d" % proc)
         finally:
-            self._put_reply_mr(call.reply_mr)
-            if call.write_mr is not None:
-                self._put_write_mr(call.write_mr)
+            for mr in (call.reply_mr, call.write_mr):
+                if mr is not None:
+                    self._put_mr(mr)
         if payload:
             record = RecordWithPayload(record, payload)
         self._dispatch(record)
@@ -657,14 +675,11 @@ class RdmaPipe(RpcPipe):
             calls = list(self._pending_calls.values())
             self._pending_calls.clear()
         with self._lock:
-            reply_mrs, self._free_reply_mrs = self._free_reply_mrs, []
-            for idle in self._free_write_mrs.values():
-                reply_mrs.extend(idle)
-            self._free_write_mrs = {}
-        mrs = self._recv_mrs + [send_mr] + reply_mrs
+            idle_mrs = [mr for idle in self._free_mrs.values() for mr in idle]
+            self._free_mrs = {}
+        mrs = self._recv_mrs + [send_mr] + idle_mrs
         for call in calls:
-            mrs.append(call.reply_mr)
-            for mr in (call.call_mr, call.write_mr):
+            for mr in (call.reply_mr, call.call_mr, call.write_mr):
                 if mr is not None:
                     mrs.append(mr)
         self._free(mrs)
@@ -672,7 +687,7 @@ class RdmaPipe(RpcPipe):
     def _free(self, mrs=None):
         """MRs first, then the QP, the CQ, the PD and the CM id."""
         if mrs is None:
-            mrs = self._recv_mrs + [self._send_mr] + self._free_reply_mrs
+            mrs = self._recv_mrs + [self._send_mr]
         with self._conn_lock:
             if self._freed:
                 return
