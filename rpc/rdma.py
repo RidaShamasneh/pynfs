@@ -18,6 +18,12 @@ How messages travel:
     can not send it), so the inline size stays at the 1024 byte default.
   * The backchannel works over the same connection: calls from the server
     arrive as inline RDMA_MSG and are answered with an inline RDMA_MSG.
+  * Connection loss: when the peer disconnects or the QP breaks, the receive
+    thread notices (flush completions), every call still waiting for a reply
+    fails at once with RdmaError, later calls fail immediately, is_active()
+    turns False and the verbs resources are freed.  There is no reconnect.
+    A peer that vanishes without any disconnect is only noticed by the next
+    send failing; a call that merely times out leaves the connection alone.
   * AUTH_NONE/AUTH_SYS are fine, GSS is untested.
 
 Requires the pyverbs python bindings (python3-pyverbs on Debian/Ubuntu).
@@ -111,7 +117,8 @@ class RdmaPipe(RpcPipe):
         self._en = en
         self._s = None
         self._handler = handler
-        self._closed = False
+        self._closed = False            # close() was called
+        self._lost = None               # why the connection is unusable
         self._pending = {}              # xid -> DeferredData (see RpcPipe)
         self._pending_calls = {}        # xid -> _Call, chunks in use
         self._lock = threading.Lock()
@@ -194,6 +201,7 @@ class RdmaPipe(RpcPipe):
     # ---- sending -------------------------------------------------------
     def push_record(self, record):
         """Send one RPC call/reply, inline or as a long call."""
+        self._check_alive()
         xid, mtype = struct.unpack(">II", record[:8])
         if mtype == 1:      # REPLY, to a call the server made (backchannel)
             msg = (RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._recv_slots,
@@ -205,10 +213,9 @@ class RdmaPipe(RpcPipe):
             return
         with self._credit_cv:
             while len(self._pending_calls) >= self._credits and \
-                    not self._closed:
+                    self._lost is None:
                 self._credit_cv.wait(1.0)
-            if self._closed:
-                raise RdmaError("connection closed")
+            self._check_alive()
             reply_mr = self._get_reply_mr()
             call = _Call(reply_mr)
             self._pending_calls[xid] = call
@@ -241,20 +248,33 @@ class RdmaPipe(RpcPipe):
             self._release(xid)
             raise
 
+    def _check_alive(self):
+        if self._lost is not None:
+            raise RdmaError("RDMA connection lost: %s" % self._lost)
+
     def _send(self, msg):
         with self._send_lock:
-            mr = self._send_mrs.get(len(msg))
-            if mr is None:
-                mr = self._send_mrs[len(msg)] = self._cmid.reg_msgs(len(msg))
-            mr.write(msg, len(msg))
-            self._cmid.post_send(mr)
+            self._check_alive()
+            try:
+                mr = self._send_mrs.get(len(msg))
+                if mr is None:
+                    mr = self._send_mrs[len(msg)] = \
+                        self._cmid.reg_msgs(len(msg))
+                mr.write(msg, len(msg))
+                self._cmid.post_send(mr)
+            except Exception as e:
+                self._connection_lost("send failed: %s" % e)
+                self._check_alive()
             while True:
                 n, wcs = self._scq.poll(1)
                 if n:
                     break
+                self._check_alive()     # the receive thread may find it first
                 time.sleep(0.0002)
             if wcs[0].status != 0:
-                raise RdmaError("send failed, wc status %d" % wcs[0].status)
+                self._connection_lost("send failed, wc status %d"
+                                      % wcs[0].status)
+                self._check_alive()
 
     def _release(self, xid):
         """Forget a call: free its chunks and its credit."""
@@ -270,12 +290,12 @@ class RdmaPipe(RpcPipe):
 
     # ---- receiving -----------------------------------------------------
     def _recv_loop(self):
+        reason = "closed"
         while not self._closed:
             try:
                 n, wcs = self._rcq.poll(1)
             except Exception as e:
-                if not self._closed:
-                    log_t.warn("RDMA receive failed: %s" % e)
+                reason = "receive failed: %s" % e
                 break
             if n == 0:
                 time.sleep(0.0002)
@@ -283,9 +303,8 @@ class RdmaPipe(RpcPipe):
             wc = wcs[0]
             mr = self._recv_q.popleft()
             if wc.status != 0:
-                if not self._closed:
-                    log_t.warn("RDMA receive completed with status %d"
-                               % wc.status)
+                # Normally a flush error: the peer disconnected or the QP broke
+                reason = "receive completed with wc status %d" % wc.status
                 break
             data = mr.read(wc.byte_len, 0)
             self._cmid.post_recv(mr)         # recycle the buffer
@@ -295,7 +314,54 @@ class RdmaPipe(RpcPipe):
             except Exception:
                 log_t.warn("bad RPC-over-RDMA message, dropped",
                            exc_info=True)
+        self._connection_lost(reason)
+        self._teardown()
+
+    def _connection_lost(self, reason):
+        """The connection is gone: refuse new calls, fail the waiting ones.
+
+        Safe to call more than once and from any thread.
+        """
+        with self._credit_cv:
+            if self._lost is not None:
+                return
+            self._lost = reason
+            unanswered = list(self._pending_calls)
+            self._credit_cv.notify_all()      # wake senders waiting for credit
+        if not self._closed:
+            log_t.warn("RDMA connection lost: %s" % reason)
         self.clear_active()
+        error = RdmaError("RDMA connection lost: %s" % reason)
+        # Only calls whose reply has not arrived; answered ones have already
+        # left _pending_calls and must keep the reply they were given.
+        for xid in unanswered:
+            self._fail(xid, error)
+
+    def _teardown(self):
+        """Free the verbs resources.  Runs once, on the receive thread, after
+        the connection is lost, so nothing is polling the CQs any more."""
+        # Senders check _lost under this lock, so none is using a send MR
+        with self._send_lock:
+            send_mrs, self._send_mrs = list(self._send_mrs.values()), {}
+        with self._credit_cv:
+            calls = list(self._pending_calls.values())
+            self._pending_calls.clear()
+        with self._lock:
+            reply_mrs, self._free_reply_mrs = self._free_reply_mrs, []
+        mrs = list(self._recv_q) + send_mrs + reply_mrs
+        for call in calls:
+            mrs.append(call.reply_mr)
+            if call.call_mr is not None:
+                mrs.append(call.call_mr)
+        self._recv_q.clear()
+        # MRs before the QP, the QP before its CQs, the CQs before the PD
+        closers = mrs + [self._cmid, self._scq, self._rcq, self._pd,
+                         self._probe]
+        for obj in closers:
+            try:
+                obj.close()
+            except Exception:
+                log_t.debug("closing %r failed" % (obj,), exc_info=True)
 
     def _fail(self, xid, error):
         deferred = self._pending.get(xid)
@@ -357,13 +423,15 @@ class RdmaPipe(RpcPipe):
         t.start()
 
     def close(self):
+        """Close the connection and free everything.  Calls still waiting for
+        a reply fail with RdmaError."""
         if self._closed:
             return
         self._closed = True
-        with self._credit_cv:
-            self._credit_cv.notify_all()
+        self._connection_lost("closed")
         try:
             self._cmid.disconnect()
         except Exception:
             pass
-        self.clear_active()
+        if threading.current_thread() is not self._thread:
+            self._thread.join(5.0)      # it frees the resources on its way out
