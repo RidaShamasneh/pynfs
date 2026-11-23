@@ -143,7 +143,9 @@ class WriteInPlace(RdmaServerTest):
 
     def test_a_result_after_the_write_still_lines_up(self):
         data = os.urandom(70003)
+        before = self.pipe.in_place_write_bytes
         res = self.write(0, data, [op.getattr(1 << FATTR4_SIZE)])
+        self.assertEqual(self.pipe.in_place_write_bytes - before, 70003)
         self.assertEqual(res.resarray[-1].obj_attributes[FATTR4_SIZE], 70003)
         self.assertEqual(self.read_all(self.sess, self.fh), data)
 
@@ -171,7 +173,7 @@ class WriteInPlace(RdmaServerTest):
         test_transport_units), the call goes as a long call instead."""
         data = os.urandom(70000)
         before = self.pipe.in_place_write_bytes
-        with mock.patch.object(rdma, "_split_write", lambda r, d: None):
+        with mock.patch.object(rdma, "_split_write", lambda r, d, tail=None: None):
             self.write(0, data)
         self.assertEqual(self.pipe.in_place_write_bytes, before)
         self.assertEqual(self.read_all(self.sess, self.fh), data)

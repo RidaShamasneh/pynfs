@@ -11,11 +11,12 @@ How messages travel:
     inline buffers, and takes the server's answer to size what we may send
     inline (1024 when the server sends none).
   * A call that fits the inline size goes in a single RDMA_MSG.
-  * A larger call that is mostly the data of one WRITE (the write_data hint
-    of push_record()) goes as an RDMA_MSG without that data, plus a Read
-    chunk at the position where the data belongs (RFC 8166 section 4.3,
-    RFC 8267): the data is registered where it already is in the call, not
-    copied, and the server RDMA Reads just that into its own buffers.
+  * A larger call that is mostly the data of one WRITE (the write_data and
+    write_tail hints of push_record()) goes as an RDMA_MSG without that
+    data, plus a Read chunk at the position where the data belongs
+    (RFC 8166 section 4.3, RFC 8267): the data is registered where it
+    already is in the call, not copied, and the server RDMA Reads just that
+    into its own buffers.
   * Any other larger call goes as RDMA_NOMSG with the whole RPC call in a
     Position Zero Read chunk: the call is copied to a registered buffer and
     the server RDMA Reads it (a "long call").
@@ -118,9 +119,14 @@ def _negotiated_inline(private_data, ours):
     return MIN_INLINE_SIZE, MIN_INLINE_SIZE
 
 
-def _split_write(record, data):
+def _split_write(record, data, tail_length=None):
     """Where the data of a WRITE sits in the packed call, or None if that is
     not certain.
+
+    If the caller knows how many bytes of the call come after the WRITE
+    (tail_length, the ops that follow it), that fixes the position and only a
+    few bytes are checked.  Without it the call is searched for the data,
+    which takes about as long as copying it, and it must be there only once.
 
     Returns (position of the data, the call without the data and its XDR pad,
     the length of the data with its pad).  XDR puts the pad right after the
@@ -129,12 +135,23 @@ def _split_write(record, data):
     """
     length = len(data)
     pad = (-length) % 4
-    needle = struct.pack(">I", length) + data       # the opaque, as packed
-    at = record.find(needle)
-    if at < 0 or record.find(needle, at + 1) >= 0:  # not there, or not unique
-        return None
-    start = at + 4
-    end = start + length + pad
+    if tail_length is None:
+        needle = struct.pack(">I", length) + data   # the opaque, as packed
+        at = record.find(needle)
+        if at < 0 or record.find(needle, at + 1) >= 0:   # not there, or twice
+            return None
+        start = at + 4
+        end = start + length + pad
+    else:
+        end = len(record) - tail_length
+        start = end - pad - length
+        edge = min(length, 16)          # check the ends of the data and its
+        if tail_length < 0 or start < 4 or \
+                record[start - 4:start] != struct.pack(">I", length) or \
+                record[start:start + edge] != data[:edge] or \
+                record[start + length - edge:start + length] != \
+                data[length - edge:]:   # length word, not all of it
+            return None
     if end > len(record) or record[start + length:end] != b"\0" * pad:
         return None
     return start, record[:start] + record[end:], length + pad
@@ -377,7 +394,7 @@ class RdmaPipe(RpcPipe):
 
     # ---- sending -------------------------------------------------------
     def push_record(self, record, read_size=None, reply_size=None,
-                    max_reply=None, write_data=None):
+                    max_reply=None, write_data=None, write_tail=None):
         """Send one RPC call/reply, inline or as a long call.
 
         read_size says the call has one READ of that many bytes: a big enough
@@ -394,7 +411,8 @@ class RdmaPipe(RpcPipe):
 
         write_data is the data of the one WRITE in the call: if the call is
         too big to go inline, it is sent in place with a Read chunk at that
-        position, not copied.
+        position, not copied.  write_tail is how many bytes of the call come
+        after the WRITE, which saves searching for the data.
         """
         self._check_alive()
         cap = self._reply_size if max_reply is None else \
@@ -469,7 +487,8 @@ class RdmaPipe(RpcPipe):
             if len(inline) + len(record) <= self._inline_send:
                 msg = inline + record
             elif write_data is not None:
-                msg = self._write_in_place(call, xid, record, write_data, tail)
+                msg = self._write_in_place(call, xid, record, write_data, tail,
+                                           write_tail)
             if msg is None:
                 try:
                     try:
@@ -504,12 +523,13 @@ class RdmaPipe(RpcPipe):
                         self._put_mr(mr)
             raise
 
-    def _write_in_place(self, call, xid, record, data, tail):
+    def _write_in_place(self, call, xid, record, data, tail,
+                        write_tail=None):
         """The message for a call whose WRITE data is sent in a Read chunk at
         its position, or None if that is not possible (the data is not where
         it should be, the rest does not fit inline, no memory to register):
         then the call goes as a long call."""
-        split = _split_write(record, data)
+        split = _split_write(record, data, write_tail)
         if split is None:
             return None
         position, reduced, chunk_length = split

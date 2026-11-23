@@ -88,8 +88,11 @@ RPC over RDMA
     at the position where the data belongs (RFC 8166, RFC 8267).  The data,
     with its XDR pad, is registered where it already is in the packed call,
     not copied, and the server reads just that into its own buffers.
-    NFS4Client passes the data as the write_data hint, only for AUTH_NONE or
-    AUTH_SYS and only for a COMPOUND with one WRITE.  If the transport is not
+    NFS4Client passes the data as the write_data hint, with the length of the
+    ops that follow the WRITE (write_tail), which fixes the data's position
+    without searching the call for it; that search took about as long as
+    the copy it saves.  Only for AUTH_NONE or AUTH_SYS and only for a
+    COMPOUND with one WRITE.  If the transport is not
     sure where the data is, or it does not all fit, or memory can not be
     registered, the call goes the way any other big call does:
     as RDMA_NOMSG with the whole call in a Position Zero Read chunk, copied

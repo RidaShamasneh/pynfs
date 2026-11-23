@@ -189,6 +189,13 @@ class NFS4Client(rpc.Client, rpc.Server):
             writes = [a for a in ops if a.argop == OP_WRITE]
             if len(writes) == 1 and isinstance(writes[0].opwrite.data, bytes):
                 hints["write_data"] = writes[0].opwrite.data
+                # what follows it in the call: the ops after the WRITE, which
+                # tells the transport where the data is without searching
+                after = ops[[a is writes[0] for a in ops].index(True) + 1:]
+                tail = packer(check_enum=checks, check_array=checks)
+                for a in after:
+                    tail.pack_nfs_argop4(a)
+                hints["write_tail"] = len(tail.get_buffer())
             # ... and how big a Reply chunk it needs for the rest
             bound = reply_bound(ops, tag, len(reads) == 1)
             if bound is not None:
