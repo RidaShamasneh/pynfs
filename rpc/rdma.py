@@ -18,6 +18,9 @@ How messages travel:
     can not send it), so the inline size stays at the 1024 byte default.
   * The backchannel works over the same connection: calls from the server
     arrive as inline RDMA_MSG and are answered with an inline RDMA_MSG.
+    Credits are kept apart (RFC 8167): the forward window is the server's
+    grant from Replies, capped to the receive buffers not reserved for
+    callbacks, and our backward Replies grant the reserved ones.
   * Connection loss: when the peer disconnects or the QP breaks, the receive
     thread notices (flush completions), every call still waiting for a reply
     fails at once with RdmaError, later calls fail immediately, is_active()
@@ -43,7 +46,10 @@ from .rpc import RpcPipe, log_t
 RPCRDMA_VERSION = 1
 DEFAULT_PORT = 20049
 INLINE_SIZE = 1024      # RFC 8166 section 3.3.2: default inline threshold
-RECV_SLOTS = 16         # receive buffers posted == credits we request
+RECV_SLOTS = 16         # receive buffers posted, shared by replies and
+                        # calls from the server
+BACK_SLOTS = 4          # of those, kept for calls from the server (RFC 8167):
+                        # this is the backward credit grant we give
 REPLY_CHUNK_SIZE = 256 * 1024   # largest reply that can come back
 RDMA_HDR = struct.Struct(">IIII")      # xid, vers, credits, proc
 
@@ -99,7 +105,7 @@ class RdmaPipe(RpcPipe):
     """An RpcPipe that moves records over an RPC-over-RDMA connection."""
 
     def __init__(self, handler, address, recv_slots=RECV_SLOTS,
-                 reply_size=REPLY_CHUNK_SIZE):
+                 reply_size=REPLY_CHUNK_SIZE, back_slots=BACK_SLOTS):
         # Deliberately not calling Pipe.__init__: there is no socket, no
         # write queue and no polling thread involved.
         try:
@@ -162,7 +168,14 @@ class RdmaPipe(RpcPipe):
         self._free_reply_mrs = []
         self._credits = 1               # until the server tells us more
         self._credit_cv = threading.Condition()
-        self._recv_slots = recv_slots
+        # Credits.  Every reply and every callback from the server lands in
+        # one of our receive buffers, so the calls we may have outstanding
+        # (the forward window) are capped to the buffers not kept for
+        # callbacks, whatever the server is willing to grant.
+        self._back_slots = back_slots
+        self._fwd_slots = recv_slots - back_slots
+        if self._fwd_slots < 1:
+            raise RdmaError("recv_slots must be larger than back_slots")
 
         # Responder resources are how many RDMA Reads the server may have
         # outstanding against our call chunks.
@@ -204,7 +217,8 @@ class RdmaPipe(RpcPipe):
         self._check_alive()
         xid, mtype = struct.unpack(">II", record[:8])
         if mtype == 1:      # REPLY, to a call the server made (backchannel)
-            msg = (RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._recv_slots,
+            # the credit field of a backward Reply is our backward grant
+            msg = (RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._back_slots,
                                  RDMA_MSG) + struct.pack(">III", 0, 0, 0) +
                    record)
             if len(msg) > INLINE_SIZE:
@@ -223,7 +237,7 @@ class RdmaPipe(RpcPipe):
             # no write list, and a Reply chunk the size of our buffer
             reply_chunk = (struct.pack(">II", 1, 1) +
                            _seg(reply_mr.rkey, self._reply_size, reply_mr.buf))
-            hdr = RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._recv_slots,
+            hdr = RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._fwd_slots,
                                 RDMA_MSG)
             tail = struct.pack(">I", 0) + reply_chunk  # write list, reply chunk
             inline = hdr + struct.pack(">I", 0) + tail  # read list is empty
@@ -238,7 +252,7 @@ class RdmaPipe(RpcPipe):
                 read_list = (struct.pack(">II", 1, 0) +
                              _seg(call.call_mr.rkey, len(record),
                                   call.call_mr.buf) + struct.pack(">I", 0))
-                hdr = RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._recv_slots,
+                hdr = RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._fwd_slots,
                                     RDMA_NOMSG)
                 msg = hdr + read_list + tail
                 if len(msg) > INLINE_SIZE:
@@ -374,14 +388,17 @@ class RdmaPipe(RpcPipe):
         xid, vers, credits, proc = RDMA_HDR.unpack_from(data)
         if vers != RPCRDMA_VERSION:
             raise RdmaError("unsupported RPC-RDMA version %d" % vers)
-        with self._credit_cv:
-            self._credits = max(1, credits)
         if proc == RDMA_MSG and self._is_call(data):
             # The server is calling us on the backchannel: same path as a
             # call arriving over TCP, which sends its reply with push_record
             pos, _ = _parse_chunk_lists(data, RDMA_HDR.size)
             self._dispatch(data[pos:])
             return
+        # Only a Reply to one of our calls carries the forward credit grant.
+        # In a backward Call the field is the server's own request and says
+        # nothing about how many calls we may send.
+        with self._credit_cv:
+            self._credits = min(max(1, credits), self._fwd_slots)
         call = self._release(xid)
         if call is None:
             raise RdmaError("reply with unknown xid %#x" % xid)
