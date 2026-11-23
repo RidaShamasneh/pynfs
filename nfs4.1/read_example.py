@@ -38,7 +38,7 @@ def main():
     server = args[0].encode()
     path = [c.encode() for c in args[1].split("/") if c]
     port = int(args[2]) if len(args) > 2 else (20049 if RDMA else 2049)
-    chunk = 512 if RDMA else 32768   # RDMA replies must fit inline for now
+    chunk = 32768
 
     # 1. Connect and set credentials (AUTH_SYS as the current user)
     client = nfs4client.NFS4Client(server, port, minorversion=1, rdma=RDMA)
