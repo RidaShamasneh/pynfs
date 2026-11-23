@@ -377,19 +377,26 @@ class RpcPipe(Pipe):
         del self._pending[xid]
         return reply
 
-    def rpc_send(self, rpc_msg, data=b''):
-        """Send raw data over pipe using given rpc_msg"""
+    def rpc_send(self, rpc_msg, data=b'', **hints):
+        """Send raw data over pipe using given rpc_msg
+
+        hints are for transports that can use them (see RdmaPipe.push_record),
+        and are only passed on when there are some.
+        """
         p = FancyRPCPacker()
         p.pack_rpc_msg(rpc_msg)
         header = p.get_buffer()
-        self.push_record(header + data)
+        if hints:
+            self.push_record(header + data, **hints)
+        else:
+            self.push_record(header + data)
 
     def send_reply(self, xid, body, proc_response=""):
         log_t.debug("send_reply\nbody = %r\ndata=%r" % (body, proc_response))
         msg = rpc_msg(xid, rpc_msg_body(REPLY, rbody=body))
         self.rpc_send(msg, proc_response)
 
-    def send_call(self, program, version, procedure, data, credinfo):
+    def send_call(self, program, version, procedure, data, credinfo, **hints):
         """Send a CALL, and store info needed to match and verify reply."""
         sec = credinfo.sec
         cred = sec.make_cred(credinfo)
@@ -401,7 +408,7 @@ class RpcPipe(Pipe):
         data = sec.secure_data(cred, data)
         # Store info needed be receiving thread to match and verify reply
         self._pending[xid] = DeferredData((cred, sec))
-        self.rpc_send(msg, data)
+        self.rpc_send(msg, data, **hints)
         return xid
 
     def rcv_reply(self, msg, msg_data):
@@ -949,7 +956,7 @@ class Client(ConnectionHandler):
         t.start()
 
     def send_call(self, pipe, procedure, data=b'', credinfo=None,
-                  program=None, version=None):
+                  program=None, version=None, **hints):
         if program is None: program = self.default_prog
         if version is None: version = self.default_vers
         if program is None or version is None:
@@ -959,6 +966,7 @@ class Client(ConnectionHandler):
         # XXX What to do if cred not initialized?  Currently send_call
         # does not block, but the call to init_cred will block.  Apart
         # from that, this is a logical place to do the init.
-        return pipe.send_call(program, version, procedure, data, credinfo)
+        return pipe.send_call(program, version, procedure, data, credinfo,
+                              **hints)
 
 #################################################

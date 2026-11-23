@@ -92,7 +92,17 @@ class NFS4Client(rpc.Client, rpc.Server):
         if SHOW_TRAFFIC:
             log_cb.info("compound args = %r" % (c4,))
         p.pack_COMPOUND4args(c4)
-        return self.send_call(pipe, 1, p.get_buffer(), credinfo)
+        hints = {}
+        if getattr(pipe, "supports_write_chunks", False) and \
+                credinfo.flavor in (rpc.AUTH_NONE, rpc.AUTH_SYS):
+            # An RDMA transport can have the server place the data of a READ
+            # straight into a buffer of ours.  Only with a single READ, so
+            # that it is clear which result the data belongs to, and not with
+            # GSS, where a checksum or wrapping covers the data.
+            reads = [a for a in ops if a.argop == OP_READ]
+            if len(reads) == 1:
+                hints["read_size"] = reads[0].opread.count
+        return self.send_call(pipe, 1, p.get_buffer(), credinfo, **hints)
 
     def compound(self, *args, **kwargs):
         self.tag = self.create_tag()
@@ -113,6 +123,8 @@ class NFS4Client(rpc.Client, rpc.Server):
         header, data = pipe.listen(xid, timeout)
         if data:
             p = nfs4lib.FancyNFS4Unpacker(data)
+            # READ data the server placed in a Write chunk, if any
+            p.ddp_payload = getattr(data, "payload", None)
             data = p.unpack_COMPOUND4res()
         return data
 

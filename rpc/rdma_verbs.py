@@ -150,8 +150,10 @@ class MR(object):
 
     def __init__(self, pd, size, access):
         self.size = size
-        self._buf = (c_char * size)()
-        self.addr = ctypes.addressof(self._buf)
+        # Page aligned, so that only the pages the region needs are pinned
+        # (RLIMIT_MEMLOCK counts every page it touches)
+        self._buf = (c_char * (size + 4095))()
+        self.addr = (ctypes.addressof(self._buf) + 4095) & ~4095
         self._mr = _ib.ibv_reg_mr(pd, self.addr, size, access)
         if not self._mr:
             raise _err("ibv_reg_mr(%d bytes)" % size)

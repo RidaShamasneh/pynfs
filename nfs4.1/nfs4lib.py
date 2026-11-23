@@ -216,6 +216,27 @@ class FancyNFS4Packer(NFS4Packer):
         return xdrdef.nfs4_type.dirlist4(out, data.eof)
 
 class FancyNFS4Unpacker(NFS4Unpacker):
+    # Data the transport put in an RDMA Write chunk (see rpc/rdma.py): the
+    # reply then has the READ's data length but not its bytes
+    ddp_payload = None
+
+    def unpack_READ4resok(self):
+        payload, self.ddp_payload = self.ddp_payload, None  # for the first READ
+        if payload is None:
+            return NFS4Unpacker.unpack_READ4resok(self)
+        data = xdrdef.nfs4_type.READ4resok()
+        data.eof = self.unpack_bool()
+        length = self.unpack_uint()
+        if length == 0 or len(payload) < length:
+            # nothing was placed, so the data is in the reply as usual
+            data.data = self.unpack_fstring(length)
+        else:
+            # The whole opaque, XDR pad included, is left out of the reply
+            # (nfsd does not put the pad in it), so what follows the length
+            # is the next item.  The chunk may or may not include the pad.
+            data.data = payload[:length]
+        return data
+
     def filter_bitmap4(self, data):
         """Put bitmap into single integer, instead of array of 32bit chunks"""
         out = 0
