@@ -35,7 +35,9 @@ _SMALL_REPLY_OPS = set(
         "SEQUENCE RECLAIM_COMPLETE DESTROY_SESSION DESTROY_CLIENTID "
         "FREE_STATEID EXCHANGE_ID CREATE_SESSION BACKCHANNEL_CTL "
         "BIND_CONN_TO_SESSION SECINFO SECINFO_NO_NAME SET_SSV ALLOCATE "
-        "DEALLOCATE SEEK LAYOUTRETURN LAYOUTCOMMIT WANT_DELEGATION"
+        "DEALLOCATE SEEK LAYOUTRETURN LAYOUTCOMMIT WANT_DELEGATION "
+        "COPY CLONE OFFLOAD_CANCEL OFFLOAD_STATUS IO_ADVISE LAYOUTERROR "
+        "LAYOUTSTATS SETXATTR REMOVEXATTR GET_DIR_DELEGATION"
         .split()) if "OP_" + name in globals())
 # Attributes whose values can be large
 _BIG_ATTRS = sum(1 << globals()[n] for n in (
@@ -66,7 +68,18 @@ def reply_bound(ops, tag, read_data_elsewhere):
                 total += 512 + a.opreaddir.maxcount
             elif a.argop == OP_READLINK:
                 total += 512 + 8192
+            elif a.argop == OP_LAYOUTGET:
+                total += 512 + a.oplayoutget.loga_maxcount
+            elif a.argop == OP_GETDEVICEINFO:
+                total += 512 + a.opgetdeviceinfo.gdia_maxcount
+            elif a.argop == OP_GETDEVICELIST:
+                total += 512 + 16 * a.opgetdevicelist.gdla_maxdevices
+            elif a.argop == OP_LISTXATTRS:
+                total += 512 + a.oplistxattrs.lxa_maxcount
+            elif a.argop == OP_TEST_STATEID:
+                total += 512 + 4 * len(a.optest_stateid.ts_stateids)
             else:
+                # GETXATTR, READ_PLUS, COPY_NOTIFY, unknown ops: no bound
                 return None
         return total
     except Exception:
