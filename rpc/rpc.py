@@ -386,6 +386,11 @@ class RpcPipe(Pipe):
         p = FancyRPCPacker()
         p.pack_rpc_msg(rpc_msg)
         header = p.get_buffer()
+        if "write_detached" in hints:
+            # (where in data, the data left out of it): now in the message
+            position, payload = hints["write_detached"]
+            hints = dict(hints, write_detached=(len(header) + position,
+                                                payload))
         if hints:
             self.push_record(header + data, **hints)
         else:

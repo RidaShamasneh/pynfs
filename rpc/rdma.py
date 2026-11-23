@@ -11,12 +11,18 @@ How messages travel:
     inline buffers, and takes the server's answer to size what we may send
     inline (1024 when the server sends none).
   * A call that fits the inline size goes in a single RDMA_MSG.
-  * A larger call that is mostly the data of one WRITE (the write_data and
-    write_tail hints of push_record()) goes as an RDMA_MSG without that
-    data, plus a Read chunk at the position where the data belongs
-    (RFC 8166 section 4.3, RFC 8267): the data is registered where it
-    already is in the call, not copied, and the server RDMA Reads just that
-    into its own buffers.
+  * A call whose WRITE data the caller has left out of it (the write_detached
+    hint of push_record(): the call without the data, where the data
+    belongs, and the data, the caller's own bytes object; see
+    nfs4lib.DetachingNFS4Packer) goes as an RDMA_MSG without the data, plus a
+    Read chunk at that position (RFC 8166 section 4.3, RFC 8267).  The data is
+    registered where the caller has it, so none of it is copied, and the
+    server RDMA Reads just that into its own buffers.  The chunk is the data
+    with no XDR pad: the receiver rounds a Read chunk up to a multiple of
+    four itself (RFC 8166 section 3.4.5), and a pad put in the message as
+    well makes nfsd read the rest of the call one byte off.  If the rest
+    does not fit inline or the data can not be registered, the data is put
+    back and the call goes as a long call.
   * Any other larger call goes as RDMA_NOMSG with the whole RPC call in a
     Position Zero Read chunk: the call is copied to a registered buffer and
     the server RDMA Reads it (a "long call").
@@ -119,42 +125,10 @@ def _negotiated_inline(private_data, ours):
     return MIN_INLINE_SIZE, MIN_INLINE_SIZE
 
 
-def _split_write(record, data, tail_length=None):
-    """Where the data of a WRITE sits in the packed call, or None if that is
-    not certain.
-
-    If the caller knows how many bytes of the call come after the WRITE
-    (tail_length, the ops that follow it), that fixes the position and only a
-    few bytes are checked.  Without it the call is searched for the data,
-    which takes about as long as copying it, and it must be there only once.
-
-    Returns (position of the data, the call without the data and its XDR pad,
-    the length of the data with its pad).  XDR puts the pad right after the
-    data, and a Read chunk carries it with the data (RFC 8166 section 3.4.5),
-    so the chunk is a slice of the call as it is.
-    """
-    length = len(data)
-    pad = (-length) % 4
-    if tail_length is None:
-        needle = struct.pack(">I", length) + data   # the opaque, as packed
-        at = record.find(needle)
-        if at < 0 or record.find(needle, at + 1) >= 0:   # not there, or twice
-            return None
-        start = at + 4
-        end = start + length + pad
-    else:
-        end = len(record) - tail_length
-        start = end - pad - length
-        edge = min(length, 16)          # check the ends of the data and its
-        if tail_length < 0 or start < 4 or \
-                record[start - 4:start] != struct.pack(">I", length) or \
-                record[start:start + edge] != data[:edge] or \
-                record[start + length - edge:start + length] != \
-                data[length - edge:]:   # length word, not all of it
-            return None
-    if end > len(record) or record[start + length:end] != b"\0" * pad:
-        return None
-    return start, record[:start] + record[end:], length + pad
+def _put_back(record, position, data):
+    """The call with the data (and its XDR pad) back where it belongs."""
+    return (record[:position] + data + b"\0" * ((-len(data)) % 4) +
+            record[position:])
 
 
 class RecordWithPayload(bytes):
@@ -394,7 +368,7 @@ class RdmaPipe(RpcPipe):
 
     # ---- sending -------------------------------------------------------
     def push_record(self, record, read_size=None, reply_size=None,
-                    max_reply=None, write_data=None, write_tail=None):
+                    max_reply=None, write_detached=None):
         """Send one RPC call/reply, inline or as a long call.
 
         read_size says the call has one READ of that many bytes: a big enough
@@ -409,10 +383,9 @@ class RdmaPipe(RpcPipe):
         what the Reply chunk may grow to.  Without it, whatever
         set_reply_size() last said, for the whole pipe.
 
-        write_data is the data of the one WRITE in the call: if the call is
-        too big to go inline, it is sent in place with a Read chunk at that
-        position, not copied.  write_tail is how many bytes of the call come
-        after the WRITE, which saves searching for the data.
+        write_detached is (position, data): record is the call without the
+        data of its WRITE, which belongs at position and is sent from where
+        the caller has it, if the call is too big to go inline.
         """
         self._check_alive()
         cap = self._reply_size if max_reply is None else \
@@ -484,11 +457,19 @@ class RdmaPipe(RpcPipe):
             tail = write_list + reply_chunk
             inline = hdr + struct.pack(">I", 0) + tail  # read list is empty
             msg = None
-            if len(inline) + len(record) <= self._inline_send:
+            if write_detached is not None:
+                position, payload = write_detached
+                whole = len(record) + len(payload) + (-len(payload)) % 4
+                if len(inline) + whole <= self._inline_send:
+                    record = _put_back(record, position, payload)
+                    msg = inline + record
+                else:
+                    msg = self._detached_in_place(call, xid, record, position,
+                                                  payload, tail)
+                    if msg is None:         # the call as it would have been
+                        record = _put_back(record, position, payload)
+            elif len(inline) + len(record) <= self._inline_send:
                 msg = inline + record
-            elif write_data is not None:
-                msg = self._write_in_place(call, xid, record, write_data, tail,
-                                           write_tail)
             if msg is None:
                 try:
                     try:
@@ -523,37 +504,31 @@ class RdmaPipe(RpcPipe):
                         self._put_mr(mr)
             raise
 
-    def _write_in_place(self, call, xid, record, data, tail,
-                        write_tail=None):
-        """The message for a call whose WRITE data is sent in a Read chunk at
-        its position, or None if that is not possible (the data is not where
-        it should be, the rest does not fit inline, no memory to register):
-        then the call goes as a long call."""
-        split = _split_write(record, data, write_tail)
-        if split is None:
-            return None
-        position, reduced, chunk_length = split
-        if len(tail) + len(reduced) + 16 + 28 > self._inline_send:
+    def _detached_in_place(self, call, xid, record, position, data, tail):
+        """The message for a call whose WRITE data is sent from where the
+        caller has it, in a Read chunk at its position, or None if that is
+        not possible (the rest does not fit inline, or no memory to register
+        it): then the data has to be put back into the call, and it goes as a
+        long call."""
+        if len(tail) + len(record) + 16 + 28 > self._inline_send:
             return None
         try:
             try:
-                mr = verbs.PinnedBytes(self._conn.pd, record, position,
-                                       chunk_length,
+                mr = verbs.PinnedBytes(self._conn.pd, data, 0, len(data),
                                        verbs.IBV_ACCESS_REMOTE_READ)
             except verbs.VerbsError:
                 if not self._reclaim_idle():
                     raise
-                mr = verbs.PinnedBytes(self._conn.pd, record, position,
-                                       chunk_length,
+                mr = verbs.PinnedBytes(self._conn.pd, data, 0, len(data),
                                        verbs.IBV_ACCESS_REMOTE_READ)
         except verbs.VerbsError as e:
-            log_t.debug("registering the data in place failed: %s" % e)
+            log_t.debug("registering the caller's data failed: %s" % e)
             return None
         read_list = (struct.pack(">II", 1, position) +
-                     _seg(mr.rkey, chunk_length, mr.addr) +
-                     struct.pack(">I", 0))
+                     _seg(mr.rkey, len(data), mr.addr) + struct.pack(">I", 0))
         msg = (RDMA_HDR.pack(xid, RPCRDMA_VERSION, self._fwd_slots,
-                             RDMA_MSG) + read_list + tail + reduced)
+                             RDMA_MSG) + read_list + tail +
+               record)
         if len(msg) > self._inline_send:
             mr.close()
             return None

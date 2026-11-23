@@ -83,20 +83,21 @@ RPC over RDMA
   * Connection setup sends the RFC 8797 private data and takes the server's
     answer to size what can go inline: 4096 bytes with nfsd, 1024 if the
     server sends none.
-  * A call that fits is one RDMA_MSG.  A bigger one that is mostly the data
-    of a single WRITE goes as an RDMA_MSG without that data, plus a Read chunk
-    at the position where the data belongs (RFC 8166, RFC 8267).  The data,
-    with its XDR pad, is registered where it already is in the packed call,
-    not copied, and the server reads just that into its own buffers.
-    NFS4Client passes the data as the write_data hint, with the length of the
-    ops that follow the WRITE (write_tail), which fixes the data's position
-    without searching the call for it; that search took about as long as
-    the copy it saves.  Only for AUTH_NONE or AUTH_SYS and only for a
-    COMPOUND with one WRITE.  If the transport is not
-    sure where the data is, or it does not all fit, or memory can not be
-    registered, the call goes the way any other big call does:
-    as RDMA_NOMSG with the whole call in a Position Zero Read chunk, copied
-    to a registered buffer, which the server reads.
+  * A call that fits is one RDMA_MSG.  A bigger one goes as RDMA_NOMSG with
+    the whole call in a Position Zero Read chunk, which the server reads: the
+    call is copied to a registered buffer first.
+  * The data of a WRITE of 32 KB or more, alone in its COMPOUND and over
+    AUTH_NONE or AUTH_SYS, is not copied at all.  NFS4Client packs the call
+    without it (nfs4lib.DetachingNFS4Packer leaves the data out and says
+    where it belongs), and the transport sends an RDMA_MSG without the data
+    plus a Read chunk at that position (RFC 8166, RFC 8267), registered
+    where the application has the data.  The server reads just that into its
+    own buffers.  The chunk is the data with no XDR pad: the receiver rounds
+    a Read chunk up itself, and a pad in the message as well makes nfsd read
+    the rest of the call one byte off.  If the rest of the call does not fit
+    inline or the data can not be registered, the data is put back and the
+    call is a long call.  Below 32 KB registering costs more than copying
+    (DETACH_WRITE_MIN in nfs4client.py).
   * Every call carries a Reply chunk, for a reply that does not fit inline.
     Its size comes from the call: NFS4Client bounds the reply from the ops
     (nfs4client.reply_bound) and the session's maximum response size caps
@@ -131,16 +132,15 @@ RPC over RDMA
 
   LIMITATIONS
   ===========
-  * Only one WRITE per COMPOUND can be sent in place; a COMPOUND with
-    several big ones, or any other big call (SETXATTR, SETATTR with a big
-    ACL), is copied into one registered buffer.  (A Linux nfsd stores the
-    second of two big WRITEs in one COMPOUND wrongly even over TCP.)
-    READ_PLUS, several READs in one COMPOUND and big
-    READDIR/READLINK/GETXATTR results come back through the Reply chunk,
-    copied.
-  * "In place" avoids copying the data into a second registered buffer.
-    The packer still builds the call in Python, so this is not zero-copy
-    from the application.
+  * Only one WRITE per COMPOUND can be sent without copying; a Linux nfsd
+    also stores the data of more than one big WRITE in a COMPOUND wrongly,
+    or rejects the call, over TCP as much as RDMA.  Other big calls (SETXATTR,
+    SETATTR with a big ACL) are copied into one registered buffer, as the
+    RFC has it: only the data of READ and WRITE may use a Read chunk at a
+    position other than zero.
+  * READ_PLUS, several READs in one COMPOUND and big READDIR/READLINK/GETXATTR
+    results come back through the Reply chunk, copied; READ data placed in a
+    Write chunk is copied once more out of the registered buffer.
   * Callbacks, and the replies to them, must fit inline.
   * No reconnect and no keepalive: a peer that vanishes without
     disconnecting is only noticed when the next send fails.
@@ -156,7 +156,7 @@ RPC over RDMA
       python3 -m unittest discover -s rdmatests -t . -v
 
   The ones that need no server always run (test_reply_bound.py,
-  test_transport_units.py).  The rest are skipped unless told where a server
+  test_transport_units.py, test_nfs_hints.py, test_packer.py).  The rest are skipped unless told where a server
   is, by environment variables:
 
       PYNFS_RDMA_SERVER=host[:port]   a server listening for RDMA
@@ -169,9 +169,10 @@ RPC over RDMA
   honours Write chunks, as a Linux nfsd does.
 
       test_data.py          data of every size survives, inline, in Read,
-                            Reply and Write chunks, and WRITE data sent in
-                            place (including odd lengths and results after
-                            the READ or WRITE)
+                            Reply and Write chunks, and WRITE data sent
+                            without copying (including odd lengths, results
+                            after the READ or WRITE, and a count of the
+                            copies made)
       test_chunk_sizes.py   which chunk buffers each kind of call registers
       test_connections.py   extra connections and several sessions; leaks
       test_memory.py        little lockable memory (lowers RLIMIT_MEMLOCK

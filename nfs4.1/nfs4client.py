@@ -44,6 +44,12 @@ _BIG_ATTRS = sum(1 << globals()[n] for n in (
     "FATTR4_ACL", "FATTR4_DACL", "FATTR4_SACL", "FATTR4_FS_LOCATIONS",
     "FATTR4_FS_LOCATIONS_INFO", "FATTR4_SEC_LABEL") if n in globals())
 
+# A WRITE with at least this much data is left out of the packed call, and an
+# RDMA transport sends it from where it is, without copying it.  Registering
+# the memory costs more than copying below about this size.
+DETACH_WRITE_MIN = 32768
+
+
 def reply_bound(ops, tag, read_data_elsewhere):
     """An upper bound for the size of the reply to a COMPOUND, or None if there
     is no useful one.  An RDMA transport sizes the Reply chunk with it, since
@@ -165,7 +171,18 @@ class NFS4Client(rpc.Client, rpc.Server):
             credinfo = self.default_cred
         if pipe is None:
             pipe = self.c1
-        p = packer(check_enum=checks, check_array=checks)
+        rdma_hints = getattr(pipe, "supports_write_chunks", False) and \
+            credinfo.flavor in (rpc.AUTH_NONE, rpc.AUTH_SYS)
+        writes = [a for a in ops if a.argop == OP_WRITE] if rdma_hints else []
+        if len(writes) == 1 and isinstance(writes[0].opwrite.data, bytes) \
+                and len(writes[0].opwrite.data) >= DETACH_WRITE_MIN \
+                and packer is nfs4lib.FancyNFS4Packer:
+            # leave the data out, so that it is not copied on the way
+            p = nfs4lib.DetachingNFS4Packer(check_enum=checks,
+                                            check_array=checks)
+            p.detach_write = True
+        else:
+            p = packer(check_enum=checks, check_array=checks)
         c4 = COMPOUND4args(tag, version, ops)
         if SHOW_TRAFFIC:
             log_cb.info("compound args = %r" % (c4,))
@@ -176,8 +193,7 @@ class NFS4Client(rpc.Client, rpc.Server):
             # the limit of the session this call belongs to: a pipe may carry
             # several, and is not always the one the session was made on
             hints["max_reply"] = max_response_size
-        if getattr(pipe, "supports_write_chunks", False) and \
-                credinfo.flavor in (rpc.AUTH_NONE, rpc.AUTH_SYS):
+        if rdma_hints:
             # An RDMA transport can have the server place the data of a READ
             # straight into a buffer of ours.  Only with a single READ, so
             # that it is clear which result the data belongs to, and not with
@@ -185,17 +201,10 @@ class NFS4Client(rpc.Client, rpc.Server):
             reads = [a for a in ops if a.argop == OP_READ]
             if len(reads) == 1:
                 hints["read_size"] = reads[0].opread.count
-            # A WRITE alone in its COMPOUND can have its data sent in place
-            writes = [a for a in ops if a.argop == OP_WRITE]
-            if len(writes) == 1 and isinstance(writes[0].opwrite.data, bytes):
-                hints["write_data"] = writes[0].opwrite.data
-                # what follows it in the call: the ops after the WRITE, which
-                # tells the transport where the data is without searching
-                after = ops[[a is writes[0] for a in ops].index(True) + 1:]
-                tail = packer(check_enum=checks, check_array=checks)
-                for a in after:
-                    tail.pack_nfs_argop4(a)
-                hints["write_tail"] = len(tail.get_buffer())
+            # The data of a WRITE left out of the call is sent from where the
+            # caller has it
+            if getattr(p, "detached", None) is not None:
+                hints["write_detached"] = p.detached
             # ... and how big a Reply chunk it needs for the rest
             bound = reply_bound(ops, tag, len(reads) == 1)
             if bound is not None:

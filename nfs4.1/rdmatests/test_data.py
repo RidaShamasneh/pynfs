@@ -1,10 +1,11 @@
 """Data survives the trip: inline, in Read chunks, Reply chunks and Write
 chunks (needs a server)."""
 import os
+import tracemalloc
 from unittest import mock
 
-from .common import (RdmaServerTest, op, rdma, ANY_STATEID, FATTR4_SIZE,
-                     OP_READ, FILE_SYNC4, check)
+from .common import (RdmaServerTest, op, rdma, nfs4client, ANY_STATEID,
+                     FATTR4_SIZE, OP_READ, FILE_SYNC4, check)
 
 
 class WriteRead(RdmaServerTest):
@@ -117,7 +118,7 @@ class WriteInPlace(RdmaServerTest):
 
     def test_big_writes_are_sent_in_place(self):
         # not multiples of 4 too: the pad goes with the data
-        for size in (5000, 5001, 5002, 5003, 60000, 100001, 500003):
+        for size in (40000, 40001, 40002, 40003, 100001, 500003):
             if size > self.maxwrite:
                 continue
             data = os.urandom(size)
@@ -126,11 +127,15 @@ class WriteInPlace(RdmaServerTest):
             self.assertEqual(self.pipe.in_place_write_bytes - before, size)
             self.assertEqual(self.read_all(self.sess, self.fh), data, size)
 
-    def test_a_write_that_fits_inline_is_not(self):
+    def test_small_writes_are_copied_as_they_always_were(self):
+        """Inline, or a long call, which costs less than registering memory
+        for so little data."""
         before = self.pipe.in_place_write_bytes
-        self.write(0, b"small")
+        for size in (5, 3000, 5000, 20000, nfs4client.DETACH_WRITE_MIN - 1):
+            data = os.urandom(size)
+            self.write(0, data)
+            self.assertEqual(self.read_all(self.sess, self.fh), data, size)
         self.assertEqual(self.pipe.in_place_write_bytes, before)
-        self.assertEqual(self.read_all(self.sess, self.fh), b"small")
 
     def test_the_largest_write_the_session_allows(self):
         size = min(self.maxwrite, 1000000)
@@ -168,15 +173,52 @@ class WriteInPlace(RdmaServerTest):
         self.assertEqual(self.pipe.in_place_write_bytes, before)
         self.assertEqual(self.read_all(self.sess, self.fh)[:50000], a)
 
-    def test_when_the_data_cannot_be_placed_the_call_is_a_long_call(self):
-        """If the transport is not sure where the data is (see SplitWrite in
-        test_transport_units), the call goes as a long call instead."""
+    def test_when_the_data_cannot_be_registered_the_call_is_a_long_call(self):
+        """If it cannot be sent from where it is (no lockable memory for it),
+        the data is put back into the call, which goes as a long call."""
+        def refuse(*args):
+            raise rdma.verbs.VerbsError("no memory")
         data = os.urandom(70000)
         before = self.pipe.in_place_write_bytes
-        with mock.patch.object(rdma, "_split_write", lambda r, d, tail=None: None):
+        with mock.patch.object(rdma.verbs, "PinnedBytes", refuse):
             self.write(0, data)
         self.assertEqual(self.pipe.in_place_write_bytes, before)
         self.assertEqual(self.read_all(self.sess, self.fh), data)
+
+    def test_sizes_around_where_the_paths_change(self):
+        """Around what fits inline, and what is left out of the call."""
+        limit = nfs4client.DETACH_WRITE_MIN
+        for size in (3000, 3800, 4000, 4090, 4095, 4096, 4097, 4099, 8191,
+                     limit - 1, limit, limit + 1, limit + 2, limit + 3):
+            data = os.urandom(size)
+            res = self.write(0, data, [op.getattr(1 << FATTR4_SIZE)])
+            self.assertEqual(res.resarray[-1].obj_attributes[FATTR4_SIZE],
+                             size, size)
+            self.assertEqual(self.read_all(self.sess, self.fh), data, size)
+
+    def test_the_data_is_not_copied_on_its_way(self):
+        """Nothing of the data is allocated in Python on the way out: it is
+        registered where the application has it.  With the data left in the
+        call, as before, there are several copies of it."""
+        size = min(self.maxwrite, 900000)
+        if size < 300000:
+            self.skipTest("the server allows writes of only %d bytes" % size)
+        data = os.urandom(size)
+        self.write(0, data)                             # warm up
+        self.assertEqual(self.pipe.in_place_write_bytes, size)
+
+        def peak():
+            tracemalloc.start()
+            try:
+                self.write(0, data)
+                return tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+        direct = peak()
+        self.assertLess(direct, size // 8, direct)
+        with mock.patch.object(nfs4client, "DETACH_WRITE_MIN", 10 ** 9):
+            copied = peak()
+        self.assertGreater(copied, size, copied)        # the measure works
 
 
 class LargeReply(RdmaServerTest):
