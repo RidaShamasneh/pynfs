@@ -88,6 +88,10 @@ def reply_bound(ops, tag, read_data_elsewhere):
 class NFS4Client(rpc.Client, rpc.Server):
     def __init__(self, host=b'localhost', port=2049, minorversion=2, ctrl_proc=16, summary=None, secure=False, rdma=False):
         self.rdma = rdma
+        # The largest response size of any session of ours: an RDMA transport
+        # sizes its Reply chunks with it, and so do the connections opened later
+        self.max_response_size = 0
+        self._rdma_pipes = []
         rpc.Client.__init__(self, NFS4_PROGRAM, NFS_V4)
         self.prog = NFS4_CALLBACK
         self.versions = [NFS_CB] # List of supported versions of prog
@@ -108,8 +112,22 @@ class NFS4Client(rpc.Client, rpc.Server):
     def connect(self, address, secure=False):
         """Open another connection to the server, over RDMA if we use it"""
         if self.rdma:
-            return self.connect_rdma(address)
+            pipe = self.connect_rdma(address)
+            self._rdma_pipes = [p for p in self._rdma_pipes if p.is_active()]
+            self._rdma_pipes.append(pipe)
+            if self.max_response_size:
+                pipe.set_reply_size(self.max_response_size)
+            return pipe
         return rpc.Client.connect(self, address, secure=secure)
+
+    def note_max_response_size(self, size):
+        """A session allows replies of up to size bytes: tell the RDMA pipes,
+        which size their Reply chunks from it (TCP needs nothing)."""
+        if size > self.max_response_size:
+            self.max_response_size = size
+            for pipe in list(self._rdma_pipes):
+                if pipe.is_active():
+                    pipe.set_reply_size(size)
 
     def set_cred(self, credinfo):
         self.default_cred = credinfo
@@ -137,7 +155,8 @@ class NFS4Client(rpc.Client, rpc.Server):
 
     def compound_async(self, ops, credinfo=None, pipe=None,
                        tag=None, version=None, checks=True,
-                       packer=nfs4lib.FancyNFS4Packer):
+                       packer=nfs4lib.FancyNFS4Packer,
+                       max_response_size=None):
         if tag is None:
             tag = self.tag
         if version is None:
@@ -152,6 +171,11 @@ class NFS4Client(rpc.Client, rpc.Server):
             log_cb.info("compound args = %r" % (c4,))
         p.pack_COMPOUND4args(c4)
         hints = {}
+        if getattr(pipe, "supports_write_chunks", False) and \
+                max_response_size is not None:
+            # the limit of the session this call belongs to: a pipe may carry
+            # several, and is not always the one the session was made on
+            hints["max_reply"] = max_response_size
         if getattr(pipe, "supports_write_chunks", False) and \
                 credinfo.flavor in (rpc.AUTH_NONE, rpc.AUTH_SYS):
             # An RDMA transport can have the server place the data of a READ
@@ -569,9 +593,9 @@ class SessionRecord(object):
         self.fore_channel = SendChannel(csr.csr_fore_chan_attrs)
         self.back_channel = RecvChannel(csr.csr_back_chan_attrs)
         # An RDMA transport sizes its Reply chunks from what the server may send
-        set_reply_size = getattr(client.c.c1, "set_reply_size", None)
-        if set_reply_size:
-            set_reply_size(self.fore_channel.maxresponsesize)
+        note_max = getattr(client.c, "note_max_response_size", None)
+        if note_max:
+            note_max(self.fore_channel.maxresponsesize)
         # STUB - and other stuff
 
     def seq_op(self, slot=None, seq_delta=1, cache_this=False):
@@ -608,6 +632,8 @@ class SessionRecord(object):
         """
         if "credinfo" not in kwargs:
             kwargs["credinfo"] = self.cred
+        kwargs.setdefault("max_response_size",
+                          self.fore_channel.maxresponsesize)
         seq_op = self.seq_op(kwargs.pop("slot", None),
                              kwargs.pop("seq_delta", 1),
                              kwargs.pop("cache_this", False))

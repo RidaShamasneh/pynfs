@@ -290,8 +290,8 @@ class RdmaPipe(RpcPipe):
 
     def set_reply_size(self, max_response_size):
         """Set the largest Reply chunk, and the size of those of calls that do
-        not say how big their reply can be, to the session's maximum response
-        size (ca_maxresponsesize)."""
+        not say how big their reply can be, for calls that do not say which
+        session's maximum response size (ca_maxresponsesize) applies."""
         size = self._clamp_reply_size(max_response_size + REPLY_SLACK)
         with self._lock:
             if size == self._reply_size:
@@ -348,7 +348,8 @@ class RdmaPipe(RpcPipe):
         mr.close()
 
     # ---- sending -------------------------------------------------------
-    def push_record(self, record, read_size=None, reply_size=None):
+    def push_record(self, record, read_size=None, reply_size=None,
+                    max_reply=None):
         """Send one RPC call/reply, inline or as a long call.
 
         read_size says the call has one READ of that many bytes: a big enough
@@ -358,8 +359,14 @@ class RdmaPipe(RpcPipe):
         reply_size is an upper bound for the reply, READ data not counted if
         there is a read_size: the Reply chunk is sized for it.  Without it
         the Reply chunk can take anything the session allows.
+
+        max_reply is the most the call's session allows as a reply; it is
+        what the Reply chunk may grow to.  Without it, whatever
+        set_reply_size() last said, for the whole pipe.
         """
         self._check_alive()
+        cap = self._reply_size if max_reply is None else \
+            self._clamp_reply_size(max_reply + REPLY_SLACK)
         xid, mtype = struct.unpack(">II", record[:8])
         if mtype == 1:      # REPLY, to a call the server made (backchannel)
             # the credit field of a backward Reply is our backward grant
@@ -378,7 +385,7 @@ class RdmaPipe(RpcPipe):
             while True:
                 # A Write chunk for the READ data, if it is worth it
                 write_mr = None
-                if read_size and WRITE_CHUNK_MIN < read_size <= self._reply_size:
+                if read_size and WRITE_CHUNK_MIN < read_size <= cap:
                     write_mr = self._get_mr(read_size)
                 reply_mr = None
                 if write_mr is not None and reply_size is not None and \
@@ -387,11 +394,10 @@ class RdmaPipe(RpcPipe):
                     # chunk, so nothing more to pin.
                     break
                 # A Reply chunk for the whole reply, READ data included
-                want = self._reply_size
+                want = cap
                 if reply_size is not None:
                     want = max(REPLY_CHUNK_SIZE, min(
-                        reply_size + (read_size or 0) + REPLY_SLACK,
-                        self._reply_size))
+                        reply_size + (read_size or 0) + REPLY_SLACK, cap))
                 # Out of lockable memory: wait for a call in flight to
                 # finish and give its buffers back.  If there is none, make do
                 # with a smaller chunk
