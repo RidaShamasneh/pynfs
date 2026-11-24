@@ -26,8 +26,78 @@ log_cb = logging.getLogger("nfs.client.cb")
 op4 = nfs_ops.NFS4ops()
 SHOW_TRAFFIC = 0
 
+# Ops whose results are small, a few hundred bytes at most
+_SMALL_REPLY_OPS = set(
+    globals()["OP_" + name] for name in (
+        "PUTFH PUTROOTFH PUTPUBFH GETFH SAVEFH RESTOREFH LOOKUP LOOKUPP OPEN "
+        "OPEN_DOWNGRADE CLOSE ACCESS COMMIT CREATE DELEGPURGE DELEGRETURN LINK "
+        "LOCK LOCKT LOCKU NVERIFY VERIFY REMOVE RENAME RENEW SETATTR WRITE "
+        "SEQUENCE RECLAIM_COMPLETE DESTROY_SESSION DESTROY_CLIENTID "
+        "FREE_STATEID EXCHANGE_ID CREATE_SESSION BACKCHANNEL_CTL "
+        "BIND_CONN_TO_SESSION SECINFO SECINFO_NO_NAME SET_SSV ALLOCATE "
+        "DEALLOCATE SEEK LAYOUTRETURN LAYOUTCOMMIT WANT_DELEGATION "
+        "COPY CLONE OFFLOAD_CANCEL OFFLOAD_STATUS IO_ADVISE LAYOUTERROR "
+        "LAYOUTSTATS SETXATTR REMOVEXATTR GET_DIR_DELEGATION"
+        .split()) if "OP_" + name in globals())
+# Attributes whose values can be large
+_BIG_ATTRS = sum(1 << globals()[n] for n in (
+    "FATTR4_ACL", "FATTR4_DACL", "FATTR4_SACL", "FATTR4_FS_LOCATIONS",
+    "FATTR4_FS_LOCATIONS_INFO", "FATTR4_SEC_LABEL") if n in globals())
+
+# A WRITE with at least this much data is left out of the packed call, and an
+# RDMA transport sends it from where it is, without copying it.  Registering
+# the memory costs more than copying below about this size.
+DETACH_WRITE_MIN = 32768
+
+
+def reply_bound(ops, tag, read_data_elsewhere):
+    """An upper bound for the size of the reply to a COMPOUND, or None if there
+    is no useful one.  An RDMA transport sizes the Reply chunk with it, since
+    the most a session allows is far more than most replies need.
+
+    read_data_elsewhere: the data of a READ comes some other way (an RDMA Write
+    chunk), so it is not counted.  Wrong guesses are not an option, a reply
+    that does not fit fails the call: whatever is not known here is None.
+    """
+    try:
+        total = 1024 + len(tag)         # RPC and COMPOUND headers, the tag
+        for a in ops:
+            if a.argop in _SMALL_REPLY_OPS:
+                total += 512
+            elif a.argop == OP_GETATTR:
+                if a.opgetattr.attr_request & _BIG_ATTRS:
+                    return None
+                total += 2048
+            elif a.argop == OP_READ:
+                total += 512 + (0 if read_data_elsewhere else a.opread.count)
+            elif a.argop == OP_READDIR:
+                total += 512 + a.opreaddir.maxcount
+            elif a.argop == OP_READLINK:
+                total += 512 + 8192
+            elif a.argop == OP_LAYOUTGET:
+                total += 512 + a.oplayoutget.loga_maxcount
+            elif a.argop == OP_GETDEVICEINFO:
+                total += 512 + a.opgetdeviceinfo.gdia_maxcount
+            elif a.argop == OP_GETDEVICELIST:
+                total += 512 + 16 * a.opgetdevicelist.gdla_maxdevices
+            elif a.argop == OP_LISTXATTRS:
+                total += 512 + a.oplistxattrs.lxa_maxcount
+            elif a.argop == OP_TEST_STATEID:
+                total += 512 + 4 * len(a.optest_stateid.ts_stateids)
+            else:
+                # GETXATTR, READ_PLUS, COPY_NOTIFY, unknown ops: no bound
+                return None
+        return total
+    except Exception:
+        return None
+
 class NFS4Client(rpc.Client, rpc.Server):
-    def __init__(self, host=b'localhost', port=2049, minorversion=2, ctrl_proc=16, summary=None, secure=False):
+    def __init__(self, host=b'localhost', port=2049, minorversion=2, ctrl_proc=16, summary=None, secure=False, rdma=False):
+        self.rdma = rdma
+        # The largest response size of any session of ours: an RDMA transport
+        # sizes its Reply chunks with it, and so do the connections opened later
+        self.max_response_size = 0
+        self._rdma_pipes = []
         rpc.Client.__init__(self, NFS4_PROGRAM, NFS_V4)
         self.prog = NFS4_CALLBACK
         self.versions = [NFS_CB] # List of supported versions of prog
@@ -39,11 +109,31 @@ class NFS4Client(rpc.Client, rpc.Server):
                                     nfs4lib.get_nfstime())
         self.verifier = struct.pack('>d', time.time())
         self.server_address = (host, port)
-        self.c1 = self.connect(self.server_address,secure=secure)
+        self.c1 = self.connect(self.server_address, secure=secure)
         self.sessions = {} # XXX Really, this should be per server
         self.clients = {} # XXX Really, this should be per server
         self.ctrl_proc = ctrl_proc
         self.summary = summary
+
+    def connect(self, address, secure=False):
+        """Open another connection to the server, over RDMA if we use it"""
+        if self.rdma:
+            pipe = self.connect_rdma(address)
+            self._rdma_pipes = [p for p in self._rdma_pipes if p.is_active()]
+            self._rdma_pipes.append(pipe)
+            if self.max_response_size:
+                pipe.set_reply_size(self.max_response_size)
+            return pipe
+        return rpc.Client.connect(self, address, secure=secure)
+
+    def note_max_response_size(self, size):
+        """A session allows replies of up to size bytes: tell the RDMA pipes,
+        which size their Reply chunks from it (TCP needs nothing)."""
+        if size > self.max_response_size:
+            self.max_response_size = size
+            for pipe in list(self._rdma_pipes):
+                if pipe.is_active():
+                    pipe.set_reply_size(size)
 
     def set_cred(self, credinfo):
         self.default_cred = credinfo
@@ -71,7 +161,8 @@ class NFS4Client(rpc.Client, rpc.Server):
 
     def compound_async(self, ops, credinfo=None, pipe=None,
                        tag=None, version=None, checks=True,
-                       packer=nfs4lib.FancyNFS4Packer):
+                       packer=nfs4lib.FancyNFS4Packer,
+                       max_response_size=None):
         if tag is None:
             tag = self.tag
         if version is None:
@@ -80,12 +171,45 @@ class NFS4Client(rpc.Client, rpc.Server):
             credinfo = self.default_cred
         if pipe is None:
             pipe = self.c1
-        p = packer(check_enum=checks, check_array=checks)
+        rdma_hints = getattr(pipe, "supports_write_chunks", False) and \
+            credinfo.flavor in (rpc.AUTH_NONE, rpc.AUTH_SYS)
+        writes = [a for a in ops if a.argop == OP_WRITE] if rdma_hints else []
+        if len(writes) == 1 and isinstance(writes[0].opwrite.data, bytes) \
+                and len(writes[0].opwrite.data) >= DETACH_WRITE_MIN \
+                and packer is nfs4lib.FancyNFS4Packer:
+            # leave the data out, so that it is not copied on the way
+            p = nfs4lib.DetachingNFS4Packer(check_enum=checks,
+                                            check_array=checks)
+            p.detach_write = True
+        else:
+            p = packer(check_enum=checks, check_array=checks)
         c4 = COMPOUND4args(tag, version, ops)
         if SHOW_TRAFFIC:
             log_cb.info("compound args = %r" % (c4,))
         p.pack_COMPOUND4args(c4)
-        return self.send_call(pipe, 1, p.get_buffer(), credinfo)
+        hints = {}
+        if getattr(pipe, "supports_write_chunks", False) and \
+                max_response_size is not None:
+            # the limit of the session this call belongs to: a pipe may carry
+            # several, and is not always the one the session was made on
+            hints["max_reply"] = max_response_size
+        if rdma_hints:
+            # An RDMA transport can have the server place the data of a READ
+            # straight into a buffer of ours.  Only with a single READ, so
+            # that it is clear which result the data belongs to, and not with
+            # GSS, where a checksum or wrapping covers the data.
+            reads = [a for a in ops if a.argop == OP_READ]
+            if len(reads) == 1:
+                hints["read_size"] = reads[0].opread.count
+            # The data of a WRITE left out of the call is sent from where the
+            # caller has it
+            if getattr(p, "detached", None) is not None:
+                hints["write_detached"] = p.detached
+            # ... and how big a Reply chunk it needs for the rest
+            bound = reply_bound(ops, tag, len(reads) == 1)
+            if bound is not None:
+                hints["reply_size"] = bound
+        return self.send_call(pipe, 1, p.get_buffer(), credinfo, **hints)
 
     def compound(self, *args, **kwargs):
         self.tag = self.create_tag()
@@ -106,6 +230,8 @@ class NFS4Client(rpc.Client, rpc.Server):
         header, data = pipe.listen(xid, timeout)
         if data:
             p = nfs4lib.FancyNFS4Unpacker(data)
+            # READ data the server placed in a Write chunk, if any
+            p.ddp_payload = getattr(data, "payload", None)
             data = p.unpack_COMPOUND4res()
         return data
 
@@ -486,6 +612,10 @@ class SessionRecord(object):
         self.cred = client.cred
         self.fore_channel = SendChannel(csr.csr_fore_chan_attrs)
         self.back_channel = RecvChannel(csr.csr_back_chan_attrs)
+        # An RDMA transport sizes its Reply chunks from what the server may send
+        note_max = getattr(client.c, "note_max_response_size", None)
+        if note_max:
+            note_max(self.fore_channel.maxresponsesize)
         # STUB - and other stuff
 
     def seq_op(self, slot=None, seq_delta=1, cache_this=False):
@@ -522,6 +652,8 @@ class SessionRecord(object):
         """
         if "credinfo" not in kwargs:
             kwargs["credinfo"] = self.cred
+        kwargs.setdefault("max_response_size",
+                          self.fore_channel.maxresponsesize)
         seq_op = self.seq_op(kwargs.pop("slot", None),
                              kwargs.pop("seq_delta", 1),
                              kwargs.pop("cache_this", False))

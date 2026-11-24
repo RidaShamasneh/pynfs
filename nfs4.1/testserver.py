@@ -159,6 +159,10 @@ def scan_options(p):
                     "they will run.")
     g.add_option("--secure", action="store_true", default=False,
                  help="Try to use 'secure' port number <1024 for client [False]")
+    g.add_option("--rdma", action="store_true", default=False,
+                 help="Use RPC-over-RDMA instead of TCP, port 20049 unless "
+                 "the server URL gives another one (needs librdmacm and libibverbs) "
+                 "[False]")
     p.add_option_group(g)
 
 
@@ -258,6 +262,8 @@ def main():
         p.error("%s not a valid server name" % url)
 
     opt.server, opt.port = server_list[0]
+    if opt.rdma and opt.port == 2049:
+        opt.port = 20049 # the usual NFS/RDMA port
 
     if not args:
         p.error("No tests given")

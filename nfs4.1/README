@@ -44,6 +44,157 @@ Server testing
        nfs4/nfs4client.py:NFS4Client(), but requires a bit of familiarity with code.
 
 
+RPC over RDMA
+=============
+
+  The client side of pynfs (the library and the tests that use it) can talk
+  to a server over RPC-over-RDMA version 1 (RFC 8166) instead of TCP:
+
+      ./testserver.py --rdma SERVER[:PORT]/PATH <options> <tests>
+      ./read_example.py --rdma SERVER /export/file
+
+  The port is 20049, the usual one for NFS over RDMA, unless the URL gives
+  another.  In your own code: NFS4Client(host, port, minorversion, rdma=True).
+  NFSv4.1 and 4.2 only; nfs4.0, nfs3client and the proxy and data server do
+  not use it.
+
+  REQUIREMENTS
+  ============
+  librdmacm and libibverbs from rdma-core (Debian: librdmacm1 libibverbs1
+  ibverbs-providers; Fedora: librdmacm libibverbs).  Nothing else: the
+  transport reaches them with ctypes (rpc/rdma_verbs.py), loaded the first
+  time an RDMA connection is made, so nothing changes for TCP.  The struct
+  offsets in that file come from the rdma-core headers and are part of the
+  stable libibverbs/librdmacm ABI; they have been tried against rdma-core 28.
+
+  SETTING UP A SERVER
+  ===================
+  Linux nfsd (it must also allow connections from high ports: "insecure"):
+      modprobe rpcrdma
+      echo "rdma 20049" > /proc/fs/nfsd/portlist
+  With no RDMA hardware, soft-RoCE is enough, and is what this was developed
+  against (a Linux nfsd 5.15):
+      rdma link add rxe0 type rxe netdev eth0
+  The client needs memory it can pin: see RLIMIT_MEMLOCK ("ulimit -l")
+  below.
+
+  HOW IT WORKS (rpc/rdma.py: RdmaPipe, a drop-in replacement for RpcPipe)
+  ==============
+  * Connection setup sends the RFC 8797 private data and takes the server's
+    answer to size what can go inline: 4096 bytes with nfsd, 1024 if the
+    server sends none.
+  * A call that fits is one RDMA_MSG.  A bigger one goes as RDMA_NOMSG with
+    the whole call in a Position Zero Read chunk, which the server reads: the
+    call is copied to a registered buffer first.
+  * The data of a WRITE of 32 KB or more, alone in its COMPOUND and over
+    AUTH_NONE or AUTH_SYS, is not copied at all.  NFS4Client packs the call
+    without it (nfs4lib.DetachingNFS4Packer leaves the data out and says
+    where it belongs), and the transport sends an RDMA_MSG without the data
+    plus a Read chunk at that position (RFC 8166, RFC 8267), registered
+    where the application has the data.  The server reads just that into its
+    own buffers.  The chunk is the data with no XDR pad: the receiver rounds
+    a Read chunk up itself, and a pad in the message as well makes nfsd read
+    the rest of the call one byte off.  If the rest of the call does not fit
+    inline or the data can not be registered, the data is put back and the
+    call is a long call.  Below 32 KB registering costs more than copying
+    (DETACH_WRITE_MIN in nfs4client.py).
+  * Every call carries a Reply chunk, for a reply that does not fit inline.
+    Its size comes from the call: NFS4Client bounds the reply from the ops
+    (nfs4client.reply_bound) and the session's maximum response size caps
+    it.  Whatever cannot be bounded gets the session maximum, 64 KB..4 MB.
+  * A READ of more than 2 KB, alone in its COMPOUND and over AUTH_NONE or
+    AUTH_SYS, also carries a Write chunk: the server writes the data
+    straight into our memory (RFC 8267) and the reply has the length but
+    not the bytes.  The transport hands the data up with the record and
+    nfs4lib.FancyNFS4Unpacker puts it back into the READ result.
+  * nfsd wants the Reply chunk to hold the whole reply, READ data included,
+    even with a Write chunk, and drops the connection if it does not.  So
+    the READ count is part of the size, and when the rest of the reply is
+    known to fit inline there is no Reply chunk at all.
+  * The backchannel uses the same connection: calls from the server arrive
+    inline and are answered inline.  Credits for the two directions are kept
+    apart (RFC 8167): the forward window is the server's grant capped to the
+    receive buffers not set aside for callbacks.
+  * When the peer disconnects or the QP breaks, every call waiting for a
+    reply fails at once with RdmaError (not after pynfs's 300 s timeout),
+    later calls fail immediately, and everything is freed.  There is no
+    reconnect.  A call that only times out leaves the connection alone.
+  * One thread waits on the completion channel and the connection-manager
+    events and takes the replies; nothing polls.
+
+  MEMORY
+  ======
+  Chunk buffers are pinned and count against RLIMIT_MEMLOCK.  Buffers are
+  page aligned and idle ones are pooled (at most 4 MB).  When one cannot be
+  registered a call waits for another to finish, then makes do with a smaller
+  Reply chunk; a reply too big for it then fails with RdmaError.  The sizes
+  are constants at the top of rpc/rdma.py.
+
+  LIMITATIONS
+  ===========
+  * Only one WRITE per COMPOUND can be sent without copying; a Linux nfsd
+    also stores the data of more than one big WRITE in a COMPOUND wrongly,
+    or rejects the call, over TCP as much as RDMA.  Other big calls (SETXATTR,
+    SETATTR with a big ACL) are copied into one registered buffer, as the
+    RFC has it: only the data of READ and WRITE may use a Read chunk at a
+    position other than zero.
+  * Only one READ per COMPOUND gets a Write chunk.  A Write list with more
+    than one chunk is mishandled by nfsd 5.15: it reports them all as filled,
+    leaves them untouched and sends a reply that does not decode.  So several
+    READs, READ_PLUS and big READDIR/READLINK/GETXATTR results come back
+    through the Reply chunk (READDIR is not eligible for a Write chunk in
+    the first place), and are copied out of it, twice.
+  * READ data placed in a Write chunk is copied once out of the registered
+    buffer, about 2% of the time of a 900 KB READ; avoiding it would mean the
+    server writing into an immutable bytes object.
+  * Callbacks, and the replies to them, must fit inline.
+  * No reconnect and no keepalive: a peer that vanishes without
+    disconnecting is only noticed when the next send fails.
+  * The Reply chunk rule above is what nfsd 5.15 does.  Only that nfsd, over
+    soft-RoCE, has been tried; other servers, iWARP, real hardware and
+    RPCSEC_GSS have not (GSS gets no Write chunks).
+  * Idle pooled buffers stay remotely writable until they are freed.
+
+  TESTS OF THE TRANSPORT
+  ======================
+  nfs4.1/rdmatests holds unit tests.  From the nfs4.1 directory:
+
+      python3 -m unittest discover -s rdmatests -t . -v
+
+  The ones that need no server always run (test_reply_bound.py,
+  test_transport_units.py, test_nfs_hints.py, test_packer.py,
+  test_rpc_logging.py).  The rest are skipped unless told where a server
+  is, by environment variables:
+
+      PYNFS_RDMA_SERVER=host[:port]   a server listening for RDMA
+      PYNFS_EXPORT=/path              a writable directory on it
+      PYNFS_UID, PYNFS_GID            AUTH_SYS identity (default: ours; it
+                                      must be allowed to write there)
+      PYNFS_FAKE_ADDR=addr            an address of a local RDMA interface
+
+  They create and remove files in PYNFS_EXPORT, and assume a server that
+  honours Write chunks, as a Linux nfsd does.
+
+      test_data.py          data of every size survives, inline, in Read,
+                            Reply and Write chunks, and WRITE data sent
+                            without copying (including odd lengths, results
+                            after the READ or WRITE, and a count of the
+                            copies made)
+      test_chunk_sizes.py   which chunk buffers each kind of call registers
+      test_connections.py   extra connections and several sessions; leaks
+      test_rpc_logging.py   a big reply is not formatted for the debug log
+      test_memory.py        little lockable memory (lowers RLIMIT_MEMLOCK
+                            for the process)
+      test_failure.py       connection loss and credits, against
+                            fakeserver.py, a fake server; needs
+                            PYNFS_FAKE_ADDR and the pyverbs python bindings
+                            (python3-pyverbs), and is skipped without them
+
+  The pynfs server tests themselves run over RDMA the same way as over TCP
+  (testserver.py --rdma); only the groups that need a server restart
+  (reboot) have not been tried.
+
+
 Server
 ======
 

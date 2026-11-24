@@ -190,6 +190,14 @@ class InvalidCompoundRes(NFSException):
         else:
             return "Invalid COMPOUND result"
 
+class _Detached(object):
+    """Stands in for the data of a WRITE the packer is to leave out."""
+    __slots__ = ("data",)
+
+    def __init__(self, data):
+        self.data = data
+
+
 class FancyNFS4Packer(NFS4Packer):
     """Handle fattr4 and dirlist4 more cleanly than auto-generated methods"""
     def filter_bitmap4(self, data):
@@ -215,7 +223,60 @@ class FancyNFS4Packer(NFS4Packer):
         # Must not modify original data structure
         return xdrdef.nfs4_type.dirlist4(out, data.eof)
 
+class DetachingNFS4Packer(FancyNFS4Packer):
+    """A packer that can leave the data of one WRITE out of what it packs.
+
+    With detach_write set, the first WRITE's data (and its XDR pad) is not
+    copied into the buffer: only its length word is.  detached is then
+    (where the data belongs in what was packed, the data itself), so a
+    transport can send the data from where it already is.  Putting it back,
+    with its pad, at that position gives what FancyNFS4Packer would have
+    packed.
+    """
+    detach_write = False
+    detached = None
+
+    def pack_WRITE4args(self, data):
+        if self.detach_write and self.detached is None and \
+                isinstance(data.data, bytes):
+            data = xdrdef.nfs4_type.WRITE4args(data.stateid, data.offset,
+                                               data.stable,
+                                               _Detached(data.data))
+        FancyNFS4Packer.pack_WRITE4args(self, data)
+
+    def pack_opaque(self, s):
+        if isinstance(s, _Detached):
+            self.pack_uint(len(s.data))
+            # how much is packed so far: the buffer is xdrlib.Packer's
+            buf = getattr(self, "_Packer__buf", None)
+            self.detached = (buf.tell() if buf is not None
+                             else len(self.get_buffer()), s.data)
+        else:
+            FancyNFS4Packer.pack_opaque(self, s)
+
+
 class FancyNFS4Unpacker(NFS4Unpacker):
+    # Data the transport put in an RDMA Write chunk (see rpc/rdma.py): the
+    # reply then has the READ's data length but not its bytes
+    ddp_payload = None
+
+    def unpack_READ4resok(self):
+        payload, self.ddp_payload = self.ddp_payload, None  # for the first READ
+        if payload is None:
+            return NFS4Unpacker.unpack_READ4resok(self)
+        data = xdrdef.nfs4_type.READ4resok()
+        data.eof = self.unpack_bool()
+        length = self.unpack_uint()
+        if length == 0 or len(payload) < length:
+            # nothing was placed, so the data is in the reply as usual
+            data.data = self.unpack_fstring(length)
+        else:
+            # The whole opaque, XDR pad included, is left out of the reply
+            # (nfsd does not put the pad in it), so what follows the length
+            # is the next item.  The chunk may or may not include the pad.
+            data.data = payload[:length]
+        return data
+
     def filter_bitmap4(self, data):
         """Put bitmap into single integer, instead of array of 32bit chunks"""
         out = 0

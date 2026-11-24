@@ -377,19 +377,31 @@ class RpcPipe(Pipe):
         del self._pending[xid]
         return reply
 
-    def rpc_send(self, rpc_msg, data=b''):
-        """Send raw data over pipe using given rpc_msg"""
+    def rpc_send(self, rpc_msg, data=b'', **hints):
+        """Send raw data over pipe using given rpc_msg
+
+        hints are for transports that can use them (see RdmaPipe.push_record),
+        and are only passed on when there are some.
+        """
         p = FancyRPCPacker()
         p.pack_rpc_msg(rpc_msg)
         header = p.get_buffer()
-        self.push_record(header + data)
+        if "write_detached" in hints:
+            # (where in data, the data left out of it): now in the message
+            position, payload = hints["write_detached"]
+            hints = dict(hints, write_detached=(len(header) + position,
+                                                payload))
+        if hints:
+            self.push_record(header + data, **hints)
+        else:
+            self.push_record(header + data)
 
     def send_reply(self, xid, body, proc_response=""):
-        log_t.debug("send_reply\nbody = %r\ndata=%r" % (body, proc_response))
+        log_t.debug("send_reply\nbody = %r\ndata=%r", body, proc_response)
         msg = rpc_msg(xid, rpc_msg_body(REPLY, rbody=body))
         self.rpc_send(msg, proc_response)
 
-    def send_call(self, program, version, procedure, data, credinfo):
+    def send_call(self, program, version, procedure, data, credinfo, **hints):
         """Send a CALL, and store info needed to match and verify reply."""
         sec = credinfo.sec
         cred = sec.make_cred(credinfo)
@@ -401,7 +413,7 @@ class RpcPipe(Pipe):
         data = sec.secure_data(cred, data)
         # Store info needed be receiving thread to match and verify reply
         self._pending[xid] = DeferredData((cred, sec))
-        self.rpc_send(msg, data)
+        self.rpc_send(msg, data, **hints)
         return xid
 
     def rcv_reply(self, msg, msg_data):
@@ -504,10 +516,10 @@ class ConnectionHandler(object):
                   }
         while not self._stopped:
             log_p.debug("Calling select")
-            log_p.log(5, "Sleeping for: %s, %s, %s" %
-                 (self.readlist, self.writelist, self.errlist))
+            log_p.log(5, "Sleeping for: %s, %s, %s",
+                      self.readlist, self.writelist, self.errlist)
             r,w,e = select.select(self.readlist, self.writelist, self.errlist)
-            log_p.log(5, "Woke with: %s, %s, %s" % (r, w, e))
+            log_p.log(5, "Woke with: %s, %s, %s", r, w, e)
             for fd in e:
                 log_p.warn(1, "polling error from %i" % fd)
                 # STUB - now what?
@@ -596,7 +608,7 @@ class ConnectionHandler(object):
         s = self.sockets[fd]
         for r in records:
             log_p.log(5, "Received record from %i" % fd)
-            log_p.log(2, repr(r))
+            log_p.log(2, "%r", r)
             t = threading.Thread(target=self._event_rpc_record, args=(r, s))
             t.setDaemon(True)
             t.start()
@@ -606,7 +618,7 @@ class ConnectionHandler(object):
 
         This is run in its own thread.
         """
-        log_t.log(5, "_event_rpc_record thread receives %r" % record)
+        log_t.log(5, "_event_rpc_record thread receives %r", record)
         # log_t.info("_event_rpc_record thread receives %r" % record)
         try:
             p = FancyRPCUnpacker(record)
@@ -619,8 +631,9 @@ class ConnectionHandler(object):
             log_t.debug("unpacking raised the following error", exc_info=True)
             self._notify_drop()
             return # Drop incorrectly encoded packets
-        log_t.debug("MSG = %s" % str(msg))
-        log_t.debug("data = %r" % msg_data)
+        # not formatted here: a reply can be megabytes of data
+        log_t.debug("MSG = %s", msg)
+        log_t.debug("data = %r", msg_data)
         if msg.mtype == REPLY:
             self._event_rpc_reply(msg, msg_data, pipe)
         elif msg.mtype == CALL:
@@ -699,7 +712,7 @@ class ConnectionHandler(object):
             if not isinstance(result, bytes):
                 raise TypeError("Expected bytes, got %s" % type(result))
             # status, result = method(msg_data, call_info)
-            log_t.debug("Called method, got %r, %r" % (status, result))
+            log_t.debug("Called method, got %r, %r", status, result)
         except rpclib.RPCDrop:
             # Silently drop the request
             self._notify_drop()
@@ -837,6 +850,16 @@ class ConnectionHandler(object):
         defer.wait()
         return pipe
 
+    def connect_rdma(self, address):
+        """Connect to given address over RPC-over-RDMA, returning new pipe
+
+        Unlike connect(), the pipe is not driven by the polling loop: it has
+        its own receive thread and sends directly.
+        """
+        from .rdma import RdmaPipe
+        log_t.info("Called connect_rdma(%r)" % (address,))
+        return RdmaPipe(self, address)
+
     def bindsocket(self, s, port=1):
         """Scan up through ports, looking for one we can bind to"""
         # This is necessary when we need to use a 'secure' port
@@ -939,7 +962,7 @@ class Client(ConnectionHandler):
         t.start()
 
     def send_call(self, pipe, procedure, data=b'', credinfo=None,
-                  program=None, version=None):
+                  program=None, version=None, **hints):
         if program is None: program = self.default_prog
         if version is None: version = self.default_vers
         if program is None or version is None:
@@ -949,6 +972,7 @@ class Client(ConnectionHandler):
         # XXX What to do if cred not initialized?  Currently send_call
         # does not block, but the call to init_cred will block.  Apart
         # from that, this is a logical place to do the init.
-        return pipe.send_call(program, version, procedure, data, credinfo)
+        return pipe.send_call(program, version, procedure, data, credinfo,
+                              **hints)
 
 #################################################

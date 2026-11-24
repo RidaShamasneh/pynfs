@@ -118,7 +118,8 @@ class Environment(testmod.Environment):
     def __init__(self, opts):
         self._lock = Lock()
         self.opts = opts
-        self.c1 = nfs4client.NFS4Client(opts.server, opts.port, opts.minorversion, secure=opts.secure)
+        self.c1 = nfs4client.NFS4Client(opts.server, opts.port, opts.minorversion, secure=opts.secure,
+                                         rdma=getattr(opts, 'rdma', False))
         s1 = rpc.security.instance(opts.flavor)
         if opts.flavor == rpc.AUTH_NONE:
             self.cred1 = s1.init_cred()
